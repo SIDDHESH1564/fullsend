@@ -43,12 +43,15 @@ func NewRepoPoolExternalMint(
 		MintURL:      mintURL,
 		GCPProjectID: gcpProjectID,
 	}
-	ens := newRepoEnsurer(ensCfg, client, token, binary, logf)
+	ens, err := newRepoEnsurer(ensCfg, client, token, binary, logf)
+	if err != nil {
+		return nil, fmt.Errorf("external mint factory: %w", err)
+	}
 	d, err := newComposedDriver(org, md, ens, poolSize, logf)
 	if err != nil {
 		return nil, err
 	}
-	return withRateLimitReporter(d, client), nil
+	return withRateLimitReporter(withMintURL(d, mintURL), client), nil
 }
 
 // Compile-time check: NewRepoPoolExternalMint satisfies Factory.

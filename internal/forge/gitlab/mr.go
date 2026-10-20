@@ -5,13 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/normevent"
 )
 
-const requestChangesMarker = "<!-- fullsend:request-changes -->"
+// requestChangesMarker is the hidden HTML comment posted on GitLab
+// REQUEST_CHANGES notes. It must match the poller/router marker so a
+// review-bot request-changes note can dispatch the fix agent.
+const requestChangesMarker = forge.ChangesRequestedMarker
 
 // CreateChangeProposal creates a merge request on GitLab.
 func (c *LiveClient) CreateChangeProposal(ctx context.Context, owner, repo, title, body, head, base string) (*forge.ChangeProposal, error) {
@@ -66,6 +72,9 @@ func (c *LiveClient) CreateCrossRepoChangeProposal(_ context.Context, _, _, _, _
 // ListRepoPullRequests lists open merge requests for a project with pagination.
 func (c *LiveClient) ListRepoPullRequests(ctx context.Context, owner, repo string) ([]forge.ChangeProposal, error) {
 	var result []forge.ChangeProposal
+	// Cache source_project_id -> path_with_namespace within this call so
+	// multiple MRs from the same fork only trigger one lookup.
+	forkPaths := make(map[int]string)
 
 	for page := 1; page <= 100; page++ {
 		path := fmt.Sprintf("/projects/%s/merge_requests?state=opened&per_page=100&page=%d",
@@ -76,12 +85,14 @@ func (c *LiveClient) ListRepoPullRequests(ctx context.Context, owner, repo strin
 		}
 
 		var mrs []struct {
-			IID          int    `json:"iid"`
-			Title        string `json:"title"`
-			WebURL       string `json:"web_url"`
-			SourceBranch string `json:"source_branch"`
-			TargetBranch string `json:"target_branch"`
-			Author       struct {
+			IID             int    `json:"iid"`
+			Title           string `json:"title"`
+			WebURL          string `json:"web_url"`
+			SourceBranch    string `json:"source_branch"`
+			TargetBranch    string `json:"target_branch"`
+			SourceProjectID int    `json:"source_project_id"`
+			TargetProjectID int    `json:"target_project_id"`
+			Author          struct {
 				Username string `json:"username"`
 			} `json:"author"`
 		}
@@ -90,13 +101,36 @@ func (c *LiveClient) ListRepoPullRequests(ctx context.Context, owner, repo strin
 		}
 
 		for _, mr := range mrs {
+			// This endpoint is scoped to owner/repo as the target project,
+			// so target_project_id always identifies it. When
+			// source_project_id matches, the head branch lives in the same
+			// project. Otherwise it's a fork: the list endpoint only gives
+			// us the source project's numeric ID, so resolve it to the
+			// "owner/repo"-shaped path_with_namespace (the same shape
+			// GitHub uses, and what callers compare HeadRepo against) via
+			// an extra lookup — mirroring the pattern GetPullRequestInfo
+			// already uses to resolve a fork's source project.
+			headRepo := owner + "/" + repo
+			if mr.SourceProjectID != mr.TargetProjectID {
+				resolved, ok := forkPaths[mr.SourceProjectID]
+				if !ok {
+					resolved, err = c.resolveProjectPath(ctx, mr.SourceProjectID)
+					if err != nil {
+						return nil, fmt.Errorf("resolve source project %d for merge request !%d: %w",
+							mr.SourceProjectID, mr.IID, err)
+					}
+					forkPaths[mr.SourceProjectID] = resolved
+				}
+				headRepo = resolved
+			}
 			result = append(result, forge.ChangeProposal{
-				Number: mr.IID,
-				URL:    mr.WebURL,
-				Title:  mr.Title,
-				Head:   mr.SourceBranch,
-				Base:   mr.TargetBranch,
-				Author: mr.Author.Username,
+				Number:   mr.IID,
+				URL:      mr.WebURL,
+				Title:    mr.Title,
+				Head:     mr.SourceBranch,
+				HeadRepo: headRepo,
+				Base:     mr.TargetBranch,
+				Author:   mr.Author.Username,
 			})
 		}
 
@@ -106,6 +140,25 @@ func (c *LiveClient) ListRepoPullRequests(ctx context.Context, owner, repo strin
 	}
 
 	return result, nil
+}
+
+// resolveProjectPath resolves a GitLab numeric project ID to its
+// "owner/repo"-shaped path_with_namespace.
+func (c *LiveClient) resolveProjectPath(ctx context.Context, projectID int) (string, error) {
+	resp, err := c.get(ctx, fmt.Sprintf("/projects/%d", projectID))
+	if err != nil {
+		return "", fmt.Errorf("get project %d: %w", projectID, err)
+	}
+	var proj struct {
+		PathWithNamespace string `json:"path_with_namespace"`
+	}
+	if err := decodeJSON(resp, &proj); err != nil {
+		return "", fmt.Errorf("decode project %d: %w", projectID, err)
+	}
+	if proj.PathWithNamespace == "" {
+		return "", fmt.Errorf("get project %d: response missing path_with_namespace", projectID)
+	}
+	return proj.PathWithNamespace, nil
 }
 
 // GetPullRequestInfo returns branch and repo context for a merge request.
@@ -214,6 +267,43 @@ func (c *LiveClient) ListPullRequestFiles(ctx context.Context, owner, repo strin
 	return files, nil
 }
 
+// ListPullRequestCommits returns the commit SHAs on a merge request,
+// oldest first. GitLab's API reports them newest first, so the result is
+// reversed.
+func (c *LiveClient) ListPullRequestCommits(ctx context.Context, owner, repo string, number int) ([]string, error) {
+	var newestFirst []string
+
+	for page := 1; page <= 100; page++ {
+		path := fmt.Sprintf("/projects/%s/merge_requests/%d/commits?per_page=100&page=%d",
+			projectPath(owner, repo), number, page)
+		resp, err := c.get(ctx, path)
+		if err != nil {
+			return nil, fmt.Errorf("list merge request commits page %d: %w", page, err)
+		}
+
+		var commits []struct {
+			ID string `json:"id"`
+		}
+		if err := decodeJSON(resp, &commits); err != nil {
+			return nil, fmt.Errorf("decode merge request commits page %d: %w", page, err)
+		}
+
+		for _, cm := range commits {
+			newestFirst = append(newestFirst, cm.ID)
+		}
+
+		if len(commits) < 100 {
+			break
+		}
+	}
+
+	shas := make([]string, 0, len(newestFirst))
+	for i := len(newestFirst) - 1; i >= 0; i-- {
+		shas = append(shas, newestFirst[i])
+	}
+	return shas, nil
+}
+
 // ListPullRequestFileDiffs returns the files changed by a merge request
 // along with their unified diff patches.
 func (c *LiveClient) ListPullRequestFileDiffs(ctx context.Context, owner, repo string, number int) ([]forge.PullRequestFileDiff, error) {
@@ -308,14 +398,18 @@ func (c *LiveClient) UpdatePullRequestBranch(ctx context.Context, owner, repo st
 //     The sticky review comment remains the authoritative record either
 //     way.
 //   - REQUEST_CHANGES or COMMENT: POST a note with the review body,
-//     plus individual notes for each inline comment.
+//     plus inline comments (see below).
 //     GitLab's Notes API has no commit-pinning parameter, so commitSHA
-//     cannot be enforced for these events.
+//     cannot be enforced for the review-body note.
 //
-// Inline comments are posted as plain MR notes with file:line in the body
-// text, not as positioned diff comments. GitLab's Discussions API supports
-// positioned comments but requires base/head/start SHAs that are not
-// available through the forge.Client interface.
+// Inline comments with a line number are posted as positioned diff
+// discussions (POST .../discussions) using the MR's current diff_refs.
+// When commitSHA is non-empty, the discussion is only positioned if
+// diff_refs.head_sha matches, so findings from an older revision are
+// not attached to a newer diff. File-level comments (Line == 0),
+// comments whose position cannot be resolved, and comments rejected
+// by the Discussions API fall back to general MR notes with a
+// `path:line` prefix — the same non-inline path used previously.
 func (c *LiveClient) CreatePullRequestReview(ctx context.Context, owner, repo string, number int, event, body, commitSHA string, comments []forge.ReviewComment) error {
 	proj := projectPath(owner, repo)
 
@@ -431,22 +525,163 @@ func (c *LiveClient) CreatePullRequestReview(ctx context.Context, owner, repo st
 		return fmt.Errorf("create review on !%d: invalid event %q", number, event)
 	}
 
-	// Post inline comments as individual notes referencing file and line.
+	return c.postInlineComments(ctx, proj, number, commitSHA, comments)
+}
+
+// mrDiffRefs is the GitLab diff_refs object that identifies a specific
+// merge-request diff version. The Discussions API requires all three
+// SHAs to attach a comment to a diff line.
+type mrDiffRefs struct {
+	BaseSHA  string
+	StartSHA string
+	HeadSHA  string
+}
+
+// usable reports whether refs can be used to position a discussion on
+// the reviewed revision. All three SHAs must be present. When
+// commitSHA is non-empty it must match HeadSHA so a finding based on
+// an older HEAD is not pinned to a newer diff.
+func (r *mrDiffRefs) usable(commitSHA string) bool {
+	if r == nil || r.BaseSHA == "" || r.StartSHA == "" || r.HeadSHA == "" {
+		return false
+	}
+	if commitSHA != "" && !strings.EqualFold(r.HeadSHA, commitSHA) {
+		return false
+	}
+	return true
+}
+
+// getMergeRequestDiffRefs fetches the current diff_refs for an MR.
+func (c *LiveClient) getMergeRequestDiffRefs(ctx context.Context, proj string, number int) (*mrDiffRefs, error) {
+	path := fmt.Sprintf("/projects/%s/merge_requests/%d", proj, number)
+	resp, err := c.get(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("get merge request !%d diff refs: %w", number, err)
+	}
+	var mr struct {
+		DiffRefs struct {
+			BaseSHA  string `json:"base_sha"`
+			StartSHA string `json:"start_sha"`
+			HeadSHA  string `json:"head_sha"`
+		} `json:"diff_refs"`
+	}
+	if err := decodeJSON(resp, &mr); err != nil {
+		return nil, fmt.Errorf("decode merge request !%d diff refs: %w", number, err)
+	}
+	return &mrDiffRefs{
+		BaseSHA:  mr.DiffRefs.BaseSHA,
+		StartSHA: mr.DiffRefs.StartSHA,
+		HeadSHA:  mr.DiffRefs.HeadSHA,
+	}, nil
+}
+
+// postInlineComments publishes review comments. Line-level comments are
+// posted as positioned discussions when the MR's current diff_refs
+// match the reviewed commit; otherwise they fall back to general notes.
+// File-level comments (Line == 0) always use notes.
+func (c *LiveClient) postInlineComments(ctx context.Context, proj string, number int, commitSHA string, comments []forge.ReviewComment) error {
+	var refs *mrDiffRefs
 	for _, rc := range comments {
-		notePath := fmt.Sprintf("/projects/%s/merge_requests/%d/notes", proj, number)
-		noteBody := rc.Body
 		if rc.Line > 0 {
-			noteBody = fmt.Sprintf("`%s:%d`\n\n%s", rc.Path, rc.Line, rc.Body)
-		} else {
-			noteBody = fmt.Sprintf("`%s`\n\n%s", rc.Path, rc.Body)
+			fetched, err := c.getMergeRequestDiffRefs(ctx, proj, number)
+			if err == nil {
+				refs = fetched
+			} else if forge.IsTransient(err) {
+				// A transient failure here (5xx, rate limit, network) would
+				// otherwise silently downgrade every inline discussion in
+				// this batch to a note with no diagnostic trail. Non-transient
+				// errors (e.g. 404 in test stubs) continue to fall back
+				// silently, matching postDiffDiscussion's own error handling
+				// below.
+				log.Printf("get merge request !%d diff refs failed, falling back to notes: %v", number, err)
+			}
+			break
 		}
-		resp, err := c.post(ctx, notePath, map[string]string{"body": noteBody})
-		if err != nil {
-			return fmt.Errorf("post inline comment on !%d (%s:%d): %w", number, rc.Path, rc.Line, err)
-		}
-		resp.Body.Close()
 	}
 
+	for _, rc := range comments {
+		if rc.Line > 0 && refs.usable(commitSHA) {
+			if err := c.postDiffDiscussion(ctx, proj, number, refs, rc); err == nil {
+				continue
+			} else if forge.IsTransient(err) {
+				// A 4xx here means GitLab rejected the diff position,
+				// which is an expected, silent fallback case handled by
+				// the note path below. forge.IsTransient(err) instead
+				// means a 5xx, rate limit, or network failure — that may
+				// indicate a systemic Discussions API problem, so log it
+				// rather than letting it degrade unnoticed to a note.
+				log.Printf("post diff discussion on !%d (%s:%d) failed, falling back to note: %v", number, rc.Path, rc.Line, err)
+			}
+		}
+		if err := c.postInlineNote(ctx, proj, number, rc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// discussionPosition is the GitLab Discussions API position object for
+// a single-line text comment on the new (right-hand) side of a diff.
+type discussionPosition struct {
+	BaseSHA      string `json:"base_sha"`
+	StartSHA     string `json:"start_sha"`
+	HeadSHA      string `json:"head_sha"`
+	PositionType string `json:"position_type"`
+	NewPath      string `json:"new_path"`
+	OldPath      string `json:"old_path"`
+	NewLine      int    `json:"new_line,omitempty"`
+}
+
+type discussionRequest struct {
+	Body     string             `json:"body"`
+	Position discussionPosition `json:"position"`
+}
+
+// postDiffDiscussion posts rc as a positioned Discussions API comment.
+//
+// forge.ReviewComment carries a single Path, so NewPath and OldPath are
+// both set to rc.Path below. For a renamed file this sends
+// old_path == new_path (the destination name), which GitLab's
+// diff-position matching may reject; the caller falls back to a plain
+// note in that case. This is a pre-existing ReviewComment limitation,
+// not specific to positioned discussions — extend ReviewComment with
+// separate old/new path fields if positioning comments on renamed
+// files is needed.
+func (c *LiveClient) postDiffDiscussion(ctx context.Context, proj string, number int, refs *mrDiffRefs, rc forge.ReviewComment) error {
+	path := fmt.Sprintf("/projects/%s/merge_requests/%d/discussions", proj, number)
+	payload := discussionRequest{
+		Body: rc.Body,
+		Position: discussionPosition{
+			BaseSHA:      refs.BaseSHA,
+			StartSHA:     refs.StartSHA,
+			HeadSHA:      refs.HeadSHA,
+			PositionType: "text",
+			NewPath:      rc.Path,
+			OldPath:      rc.Path,
+			NewLine:      rc.Line,
+		},
+	}
+	resp, err := c.post(ctx, path, payload)
+	if err != nil {
+		return fmt.Errorf("post diff discussion on !%d (%s:%d): %w", number, rc.Path, rc.Line, err)
+	}
+	resp.Body.Close()
+	return nil
+}
+
+func (c *LiveClient) postInlineNote(ctx context.Context, proj string, number int, rc forge.ReviewComment) error {
+	notePath := fmt.Sprintf("/projects/%s/merge_requests/%d/notes", proj, number)
+	noteBody := rc.Body
+	if rc.Line > 0 {
+		noteBody = fmt.Sprintf("`%s:%d`\n\n%s", rc.Path, rc.Line, rc.Body)
+	} else {
+		noteBody = fmt.Sprintf("`%s`\n\n%s", rc.Path, rc.Body)
+	}
+	resp, err := c.post(ctx, notePath, map[string]string{"body": noteBody})
+	if err != nil {
+		return fmt.Errorf("post inline comment on !%d (%s:%d): %w", number, rc.Path, rc.Line, err)
+	}
+	resp.Body.Close()
 	return nil
 }
 
@@ -535,6 +770,189 @@ func (c *LiveClient) ListPullRequestReviews(ctx context.Context, owner, repo str
 	}
 
 	return result, nil
+}
+
+type gitlabDiscussionActor struct {
+	ID       int    `json:"id"`
+	Username string `json:"username"`
+}
+
+// ListPullRequestReviewThreads maps GitLab merge-request discussions to the
+// common review-thread model. A discussion is resolved when all of its
+// resolvable notes are marked resolved; the latest resolver and note authors
+// are preserved so consumers can distinguish human and bot resolutions.
+func (c *LiveClient) ListPullRequestReviewThreads(ctx context.Context, owner, repo string, number int) (forge.ReviewThreadPage, error) {
+	proj := projectPath(owner, repo)
+	result := forge.ReviewThreadPage{}
+	actorTypes := make(map[int]string)
+	actorRoles := make(map[int]struct {
+		role     normevent.ActorRole
+		verified bool
+	})
+	lookupActorType := func(actor *gitlabDiscussionActor) string {
+		if actor == nil || actor.ID == 0 {
+			return "Unknown"
+		}
+		if actorType, ok := actorTypes[actor.ID]; ok {
+			return actorType
+		}
+
+		actorType := "Unknown"
+		resp, err := c.get(ctx, fmt.Sprintf("/users/%d", actor.ID))
+		if err == nil {
+			var user struct {
+				Bot *bool `json:"bot"`
+			}
+			if decodeErr := decodeJSON(resp, &user); decodeErr == nil {
+				actorType = gitlabActorType(user.Bot)
+			}
+		}
+		actorTypes[actor.ID] = actorType
+		return actorType
+	}
+	lookupActorRole := func(actor *gitlabDiscussionActor, actorType string) (normevent.ActorRole, bool) {
+		if actor == nil || actor.ID == 0 || actorType != "User" {
+			return normevent.RoleNone, false
+		}
+		if cached, ok := actorRoles[actor.ID]; ok {
+			return cached.role, cached.verified
+		}
+
+		level, err := c.GetProjectMemberAccessLevel(ctx, owner, repo, int64(actor.ID))
+		if err != nil {
+			verified := forge.IsNotFound(err)
+			actorRoles[actor.ID] = struct {
+				role     normevent.ActorRole
+				verified bool
+			}{normevent.RoleNone, verified}
+			return normevent.RoleNone, verified
+		}
+		role := normevent.MapGitLabAccessLevel(level)
+		actorRoles[actor.ID] = struct {
+			role     normevent.ActorRole
+			verified bool
+		}{role, true}
+		return role, true
+	}
+
+	for page := 1; page <= 20; page++ {
+		path := fmt.Sprintf("/projects/%s/merge_requests/%d/discussions?per_page=100&page=%d",
+			proj, number, page)
+		resp, err := c.get(ctx, path)
+		if err != nil {
+			return forge.ReviewThreadPage{}, fmt.Errorf("list discussions for !%d page %d: %w", number, page, err)
+		}
+
+		var discussions []struct {
+			ID    string `json:"id"`
+			Notes []struct {
+				ID         int                    `json:"id"`
+				Body       string                 `json:"body"`
+				System     bool                   `json:"system"`
+				CreatedAt  string                 `json:"created_at"`
+				Resolvable bool                   `json:"resolvable"`
+				Resolved   bool                   `json:"resolved"`
+				ResolvedAt *string                `json:"resolved_at"`
+				Author     gitlabDiscussionActor  `json:"author"`
+				ResolvedBy *gitlabDiscussionActor `json:"resolved_by"`
+				Position   *struct {
+					NewPath string `json:"new_path"`
+					OldPath string `json:"old_path"`
+					NewLine *int   `json:"new_line"`
+					OldLine *int   `json:"old_line"`
+				} `json:"position"`
+			} `json:"notes"`
+		}
+		if err := decodeJSON(resp, &discussions); err != nil {
+			return forge.ReviewThreadPage{}, fmt.Errorf("decode discussions for !%d page %d: %w", number, page, err)
+		}
+
+		for _, discussion := range discussions {
+			thread := forge.ReviewThread{ID: discussion.ID, ResolvedByRole: normevent.RoleNone}
+			hasResolvableNote := false
+			allResolvableNotesResolved := true
+			var resolvedBy *gitlabDiscussionActor
+			var resolvedAt time.Time
+			resolvedNoteID := 0
+			resolvedNoteSelected := false
+			for _, note := range discussion.Notes {
+				if note.System || !note.Resolvable {
+					continue
+				}
+				hasResolvableNote = true
+				if !note.Resolved {
+					allResolvableNotesResolved = false
+					continue
+				}
+				noteResolvedAt := time.Time{}
+				if note.ResolvedAt != nil {
+					noteResolvedAt, _ = time.Parse(time.RFC3339Nano, *note.ResolvedAt)
+				}
+				if !resolvedNoteSelected || noteResolvedAt.After(resolvedAt) ||
+					(noteResolvedAt.Equal(resolvedAt) && note.ID > resolvedNoteID) {
+					resolvedBy = note.ResolvedBy
+					resolvedAt = noteResolvedAt
+					resolvedNoteID = note.ID
+					resolvedNoteSelected = true
+				}
+			}
+			thread.IsResolved = hasResolvableNote && allResolvableNotesResolved
+			if thread.IsResolved && resolvedBy != nil {
+				thread.ResolvedBy = resolvedBy.Username
+				thread.ResolvedByType = lookupActorType(resolvedBy)
+				thread.ResolvedByRole, thread.ResolvedByRoleVerified = lookupActorRole(resolvedBy, thread.ResolvedByType)
+			}
+
+			for _, note := range discussion.Notes {
+				if note.System {
+					continue
+				}
+
+				authorType := lookupActorType(&note.Author)
+				authorRole, authorRoleVerified := lookupActorRole(&note.Author, authorType)
+				thread.Comments = append(thread.Comments, forge.ReviewThreadComment{
+					Author:             note.Author.Username,
+					AuthorType:         authorType,
+					AuthorRole:         authorRole,
+					AuthorRoleVerified: authorRoleVerified,
+					Body:               note.Body,
+					CreatedAt:          note.CreatedAt,
+				})
+				if note.Position != nil {
+					thread.Path = note.Position.NewPath
+					if note.Position.NewLine == nil && note.Position.OldLine != nil {
+						thread.Path = note.Position.OldPath
+					} else if thread.Path == "" {
+						thread.Path = note.Position.OldPath
+					}
+					thread.Line = note.Position.NewLine
+					thread.OriginalLine = note.Position.OldLine
+				}
+			}
+			result.Threads = append(result.Threads, thread)
+		}
+
+		if len(discussions) < 100 {
+			break
+		}
+		if page == 20 {
+			result.Truncated = true
+		}
+	}
+
+	return result, nil
+}
+
+// gitlabActorType fails closed when GitLab does not identify whether an actor
+// is a bot. Callers use the User value to trust a human resolution.
+func gitlabActorType(bot *bool) string {
+	if bot == nil {
+		return "Unknown"
+	}
+	if *bot {
+		return "Bot"
+	}
+	return "User"
 }
 
 // DismissPullRequestReview dismisses a review on a merge request.

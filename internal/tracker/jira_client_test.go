@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/fullsend-ai/fullsend/internal/forge"
@@ -72,6 +73,45 @@ func TestJiraClient_GetIssue(t *testing.T) {
 	}
 	if issue.URL != "https://acme.atlassian.net/browse/PROJ-42" {
 		t.Errorf("issue.URL = %q, want %q", issue.URL, "https://acme.atlassian.net/browse/PROJ-42")
+	}
+}
+
+func TestJiraClient_GetIssue_IssueTypeAndCustomFields(t *testing.T) {
+	custom := map[string]json.RawMessage{
+		"customfield_10875": json.RawMessage(`"https://github.com/acme/widgets/pull/7"`),
+	}
+	fc := &FakeJiraClient{
+		Issues: map[string]*jira.Issue{
+			"PROJ-7": {
+				Key: "PROJ-7",
+				Fields: jira.IssueFields{
+					Summary:      "Typed",
+					IssueType:    &jira.IssueType{ID: "10001", Name: "Story"},
+					CustomFields: custom,
+				},
+			},
+			"PROJ-8": {Key: "PROJ-8", Fields: jira.IssueFields{Summary: "Untyped"}},
+		},
+	}
+	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
+
+	issue, err := c.GetIssue(context.Background(), "PROJ", 7)
+	if err != nil {
+		t.Fatalf("GetIssue returned error: %v", err)
+	}
+	if issue.IssueType != "Story" {
+		t.Errorf("issue.IssueType = %q, want %q", issue.IssueType, "Story")
+	}
+	if got := string(issue.CustomFields["customfield_10875"]); got != `"https://github.com/acme/widgets/pull/7"` {
+		t.Errorf("issue.CustomFields[customfield_10875] = %s, want the PR URL", got)
+	}
+
+	issue, err = c.GetIssue(context.Background(), "PROJ", 8)
+	if err != nil {
+		t.Fatalf("GetIssue returned error: %v", err)
+	}
+	if issue.IssueType != "" || issue.CustomFields != nil {
+		t.Errorf("issue without type/custom fields: IssueType = %q, CustomFields = %v; want empty", issue.IssueType, issue.CustomFields)
 	}
 }
 
@@ -496,6 +536,125 @@ func TestJiraClient_FindCommentByMarkerProperty_LegacyFallback(t *testing.T) {
 	}
 }
 
+// A comment that quotes the sticky marker must not be picked by the
+// legacy body fallback: neither a sibling agent's property-backed comment
+// (even one whose body opens with the quoted marker) nor a property-free
+// comment that quotes it below other content.
+func TestJiraClient_FindCommentByMarkerProperty_IgnoresQuotedMarker(t *testing.T) {
+	fc := &FakeJiraClient{}
+	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
+	ctx := context.Background()
+	marker := "<!-- fullsend:triage-agent -->"
+
+	if _, err := c.CreateCommentWithMarker(ctx, "PROJ", 42, Body("review notes\n\n"+marker+"\n\nquoted"), "<!-- fullsend:review-agent -->"); err != nil {
+		t.Fatalf("CreateCommentWithMarker (mid-body quote): %v", err)
+	}
+	if _, err := c.CreateCommentWithMarker(ctx, "PROJ", 42, Body(marker+"\nquoted at the top"), "<!-- fullsend:code-agent -->"); err != nil {
+		t.Fatalf("CreateCommentWithMarker (top quote): %v", err)
+	}
+	if _, err := c.CreateStatusComment(ctx, "PROJ", 42, Body(marker+"\nstatus"), "<!-- fullsend:agent-status:run-1 -->", false); err != nil {
+		t.Fatalf("CreateStatusComment: %v", err)
+	}
+	if _, err := fc.CreateComment(ctx, "PROJ-42", "plain comment\n\n"+marker+"\n\nquoted"); err != nil {
+		t.Fatalf("CreateComment: %v", err)
+	}
+
+	jiraComments, err := c.ListJiraComments(ctx, "PROJ", 42)
+	if err != nil {
+		t.Fatalf("ListJiraComments: %v", err)
+	}
+	if found := c.FindCommentByMarkerProperty(jiraComments, marker); found != nil {
+		t.Errorf("FindCommentByMarkerProperty matched a comment that only quotes the marker: ID %s", found.ID)
+	}
+
+	// A legacy comment (marker at the top, no property) is still found,
+	// even after the quoting comments.
+	legacy, err := fc.CreateComment(ctx, "PROJ-42", "\n"+marker+"\nlegacy content")
+	if err != nil {
+		t.Fatalf("CreateComment (legacy): %v", err)
+	}
+	jiraComments, err = c.ListJiraComments(ctx, "PROJ", 42)
+	if err != nil {
+		t.Fatalf("ListJiraComments: %v", err)
+	}
+	found := c.FindCommentByMarkerProperty(jiraComments, marker)
+	if found == nil || found.ID != legacy.ID {
+		t.Fatalf("FindCommentByMarkerProperty = %+v, want legacy comment %s", found, legacy.ID)
+	}
+	if got := c.FindCommentByMarkerProperty(jiraComments, ""); got != nil {
+		t.Errorf("empty marker matched comment %s via legacy fallback", got.ID)
+	}
+}
+
+// Agent text that quotes a status marker must not make a comment count as
+// a status comment; a legacy status comment (marker at the top, no
+// property) still does.
+func TestJiraClient_IsStatusComment_IgnoresQuotedStatusMarker(t *testing.T) {
+	fc := &FakeJiraClient{}
+	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
+	ctx := context.Background()
+	statusMarker := StatusMarkerOpener + "run-7 -->"
+
+	sticky, err := c.CreateCommentWithMarker(ctx, "PROJ", 42, Body(statusMarker+"\nagent body opening with a status marker"), "<!-- fullsend:review-agent -->")
+	if err != nil {
+		t.Fatalf("CreateCommentWithMarker: %v", err)
+	}
+	quoted, err := fc.CreateComment(ctx, "PROJ-42", "Agent output:\n\n"+statusMarker+"\n\nend")
+	if err != nil {
+		t.Fatalf("CreateComment (quoted): %v", err)
+	}
+	prose, err := fc.CreateComment(ctx, "PROJ-42", "mentions "+StatusMarkerPrefix+" in prose")
+	if err != nil {
+		t.Fatalf("CreateComment (prose): %v", err)
+	}
+	legacy, err := fc.CreateComment(ctx, "PROJ-42", statusMarker+"\n<!-- fullsend:status:terminal -->\nfinished")
+	if err != nil {
+		t.Fatalf("CreateComment (legacy): %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		id   string
+		want bool
+	}{
+		{"sticky comment opening with a status marker", sticky.ID, false},
+		{"property-free comment quoting a status marker", quoted.ID, false},
+		{"prose mentioning the status prefix", prose.ID, false},
+		{"legacy status comment", legacy.ID, true},
+	} {
+		got, err := c.IsStatusComment(ctx, "PROJ", 42, tc.id)
+		if err != nil {
+			t.Fatalf("%s: IsStatusComment: %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: IsStatusComment = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The legacy status-comment lookup must not match a comment that only
+// quotes the run's marker.
+func TestJiraClient_FindStatusComment_IgnoresQuotedMarker(t *testing.T) {
+	fc := &FakeJiraClient{}
+	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
+	ctx := context.Background()
+	marker := StatusMarkerOpener + "run-9 -->"
+
+	if _, err := fc.CreateComment(ctx, "PROJ-42", "quoting\n\n"+marker+"\n<!-- fullsend:status:terminal -->"); err != nil {
+		t.Fatalf("CreateComment: %v", err)
+	}
+	if _, err := c.CreateCommentWithMarker(ctx, "PROJ", 42, Body(marker+"\nsticky body"), "<!-- fullsend:review-agent -->"); err != nil {
+		t.Fatalf("CreateCommentWithMarker: %v", err)
+	}
+	found, terminal, err := c.FindStatusComment(ctx, "PROJ", 42, marker)
+	if err != nil {
+		t.Fatalf("FindStatusComment: %v", err)
+	}
+	if found != nil || terminal {
+		t.Errorf("FindStatusComment = (%+v, %t), want no match for a quoted marker", found, terminal)
+	}
+}
+
 func TestJiraClient_MigrateAndUpdateComment(t *testing.T) {
 	fc := &FakeJiraClient{}
 	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
@@ -604,3 +763,56 @@ func TestNewFakeJiraClient(t *testing.T) {
 
 var _ Client = (*JiraClient)(nil)
 var _ StatusCommentClient = (*JiraClient)(nil)
+var _ Linker = (*JiraClient)(nil)
+var _ Mover = (*JiraClient)(nil)
+
+func TestJiraClient_AuthenticatedUser(t *testing.T) {
+	jc, fj, err := NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := jc.AuthenticatedUser(context.Background())
+	if err != nil || got != FakeJiraBot.AccountID {
+		t.Fatalf("AuthenticatedUser() = %q, %v; want the account ID, not the display name", got, err)
+	}
+
+	fj.Myself = jira.User{DisplayName: "no account id"}
+	got, err = jc.AuthenticatedUser(context.Background())
+	if err != nil || got != "" {
+		t.Fatalf("AuthenticatedUser() = %q, %v; want an empty account ID passed through for the caller to reject", got, err)
+	}
+
+	fj.MyselfError = errors.New("401")
+	if _, err := jc.AuthenticatedUser(context.Background()); err == nil {
+		t.Fatal("AuthenticatedUser() must return the GetMyself error")
+	}
+}
+
+func TestJiraClient_LinkIssues(t *testing.T) {
+	jc, fj, err := NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jc.LinkIssues(context.Background(), "PROJ", 123, "OTHER", 456, "Blocks"); err != nil {
+		t.Fatalf("LinkIssues returned error: %v", err)
+	}
+	want := FakeJiraLink{Type: "Blocks", InwardIssue: "PROJ-123", OutwardIssue: "OTHER-456"}
+	if len(fj.Links) != 1 || fj.Links[0] != want {
+		t.Fatalf("Links = %+v, want [%+v] (from issue as inward, to issue as outward)", fj.Links, want)
+	}
+}
+
+func TestJiraClient_LinkIssues_NotFound(t *testing.T) {
+	jc, fj, err := NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fj.LinkError = fmt.Errorf("link PROJ-1 to PROJ-2 (Blocks): %w", forge.ErrNotFound)
+	err = jc.LinkIssues(context.Background(), "PROJ", 1, "PROJ", 2, "Blocks")
+	if !IsNotFound(err) {
+		t.Fatalf("LinkIssues error = %v, want one satisfying IsNotFound", err)
+	}
+	if len(fj.Links) != 0 {
+		t.Fatalf("Links = %+v, want none recorded on error", fj.Links)
+	}
+}

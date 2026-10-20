@@ -11,6 +11,7 @@ Exit codes: 0 = allow, 1 = block (with reason on stdout).
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import json
 import os
@@ -42,6 +43,21 @@ BLOCKED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
     ipaddress.IPv6Network("::/128"),
     ipaddress.IPv6Network("fc00::/7"),
 ]
+
+# Inside an OpenShell sandbox, policy DNS answers every name with a synthetic
+# address from this pool. The supervisor maps it back to the real destination
+# and enforces the sandbox policy when the sandbox connects.
+OPENSHELL_SYNTHETIC_NETWORK = ipaddress.IPv4Network("198.18.0.0/15")
+OPENSHELL_POLICY_LOCAL_IP = "198.18.0.1"
+
+# Names that reach OpenShell itself rather than an external endpoint; their
+# synthetic answers are never deferred to the supervisor.
+OPENSHELL_INTERNAL_HOSTNAMES: set[str] = {
+    "policy.local",
+    "host.openshell.internal",
+    "host.docker.internal",
+    "host.containers.internal",
+}
 
 BLOCKED_SCHEMES: set[str] = {"file", "ftp", "gopher", "data", "dict", "ldap", "tftp"}
 ALLOWED_SCHEMES: set[str] = {"http", "https"}
@@ -257,11 +273,52 @@ def _parse_egress_allowlist() -> set[tuple[str, int]]:
         if not entry:
             continue
         if "*" in entry:
-            print(
-                f"WARNING: wildcard entry '{entry}' in FULLSEND_EGRESS_ALLOWLIST "
-                "is not supported and will be ignored — use exact hostnames",
-                file=sys.stderr,
-            )
+            # Accept leading wildcard entries like *.domain.com:port.
+            # Reject bare '*' and mid-string globs (e.g. 'atl*an.net').
+            if ":" in entry:
+                wc_host, _, wc_port_str = entry.rpartition(":")
+                try:
+                    wc_port = int(wc_port_str)
+                except ValueError:
+                    print(
+                        f"WARNING: malformed port in '{entry}' in FULLSEND_EGRESS_ALLOWLIST "
+                        "— entry ignored",
+                        file=sys.stderr,
+                    )
+                    continue
+            else:
+                wc_host = entry
+                wc_port = 0
+            wc_host = wc_host.lower().rstrip(".")
+            if wc_host.startswith("*.") and len(wc_host) > 2 and "*" not in wc_host[2:]:
+                # Label-depth check catches single-label TLD wildcards like
+                # *.com or *.net. It does NOT catch multi-label public
+                # suffixes such as *.co.uk, *.com.au, or *.github.io — those
+                # pass this check (>= 2 dots) and are accepted below despite
+                # spanning many independently-controlled domains. We accept
+                # this as a known residual risk rather than shipping a
+                # bundled public-suffix list: FULLSEND_EGRESS_ALLOWLIST is
+                # operator-controlled infrastructure config, not attacker
+                # input, and the L7 proxy remains the primary SSRF
+                # enforcement boundary even when this heuristic under-blocks.
+                # See docs/contributing/runtime-implementation.md.
+                if wc_host.count(".") < 2:
+                    print(
+                        f"WARNING: wildcard entry '{entry}' in FULLSEND_EGRESS_ALLOWLIST "
+                        "is overly broad (e.g. *.com matches all .com domains) "
+                        "and will be ignored — use a more specific pattern "
+                        "like *.example.com",
+                        file=sys.stderr,
+                    )
+                    continue
+                entries.add((wc_host, wc_port))
+            else:
+                print(
+                    f"WARNING: wildcard entry '{entry}' in FULLSEND_EGRESS_ALLOWLIST "
+                    "is not supported and will be ignored — use exact hostnames "
+                    "or leading wildcard patterns like *.domain.com",
+                    file=sys.stderr,
+                )
             continue
         if ":" in entry:
             host, _, port_str = entry.rpartition(":")
@@ -294,7 +351,20 @@ def _is_host_allowlisted(hostname: str, port: int | None) -> bool:
     if port is not None and (hostname, port) in allowlist:
         return True
     # Check host-only match (port 0 sentinel means any port).
-    return (hostname, 0) in allowlist
+    if (hostname, 0) in allowlist:
+        return True
+    # Check wildcard entries: *.domain matches any subdomain of domain
+    # but not the bare domain itself (require at least one subdomain label).
+    for entry_host, entry_port in allowlist:
+        if not entry_host.startswith("*."):
+            continue
+        # *.atlassian.net → suffix ".atlassian.net"
+        suffix = entry_host[1:]
+        if hostname.endswith(suffix) and (
+            entry_port == 0 or (port is not None and entry_port == port)
+        ):
+            return True
+    return False
 
 
 def log_finding(scanner: str, name: str, severity: str, detail: str, action: str):
@@ -328,6 +398,65 @@ def check_ip(ip_str: str) -> str | None:
     if ip.is_private:
         return f"IP {ip} is a private address"
     return None
+
+
+@functools.cache
+def _policy_dns_active() -> bool:
+    """Return True if OpenShell policy DNS answers this process's lookups.
+
+    Policy DNS always answers ``policy.local`` with OPENSHELL_POLICY_LOCAL_IP.
+    The agent cannot forge that: the sandbox resolver and ``/etc`` are outside
+    its control. OPENSHELL_SANDBOX only skips the lookup outside a sandbox.
+    """
+    if not os.environ.get("OPENSHELL_SANDBOX"):
+        return False
+    try:
+        answers = socket.getaddrinfo("policy.local", None, socket.AF_INET, proto=socket.IPPROTO_TCP)
+    except (OSError, TimeoutError):
+        return False
+    return {str(a[4][0]) for a in answers} == {OPENSHELL_POLICY_LOCAL_IP}
+
+
+def _is_ip_literal(hostname: str) -> bool:
+    """Return True for any IP spelling the resolver accepts (``3323068422``, ``198.18.6``)."""
+    try:
+        socket.getaddrinfo(hostname, None, flags=socket.AI_NUMERICHOST)
+    except (OSError, UnicodeError):
+        return False
+    return True
+
+
+def _is_openshell_synthetic_answer(hostname: str, resolved_ips: list[str]) -> bool:
+    """Return True if *resolved_ips* is OpenShell policy DNS's answer for *hostname*.
+
+    The hook cannot see the real destination behind a synthetic address, so
+    it defers to the supervisor. Only host names qualify, never IP literals or
+    OpenShell's own names, and only when every address is synthetic and
+    policy DNS is answering. Policy DNS returns no IPv6 answers in OpenShell
+    0.1.x; a mixed answer fails closed.
+    """
+    try:
+        # The resolver IDNA-encodes names, so compare in that form
+        # (fullwidth ``policy.local`` resolves as ``policy.local``).
+        canonical = hostname.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError:
+        return False
+    if (
+        canonical in OPENSHELL_INTERNAL_HOSTNAMES
+        or canonical in BLOCKED_HOSTNAMES
+        or _is_ip_literal(hostname)
+    ):
+        return False
+    try:
+        if not resolved_ips or any(
+            ip == OPENSHELL_POLICY_LOCAL_IP
+            or ipaddress.ip_address(ip) not in OPENSHELL_SYNTHETIC_NETWORK
+            for ip in resolved_ips
+        ):
+            return False
+    except ValueError:
+        return False
+    return _policy_dns_active()
 
 
 def validate_url(url: str) -> str | None:
@@ -368,8 +497,18 @@ def validate_url(url: str) -> str | None:
     try:
         socket.setdefaulttimeout(2.0)
         addrinfos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-        for _family, _, _, _, sockaddr in addrinfos:
-            resolved_ip = str(sockaddr[0])
+        resolved_ips = [str(sockaddr[0]) for _family, _, _, _, sockaddr in addrinfos]
+        if _is_openshell_synthetic_answer(hostname, resolved_ips):
+            log_finding(
+                scanner="ssrf",
+                name="openshell_policy_dns_defer",
+                severity="info",
+                detail=f"{hostname} resolved to OpenShell synthetic {resolved_ips}; "
+                "deferring to the sandbox supervisor",
+                action="allow",
+            )
+            return None
+        for resolved_ip in resolved_ips:
             ip_reason = check_ip(resolved_ip)
             if ip_reason:
                 return f"DNS rebinding: {hostname} resolved to blocked {resolved_ip} ({ip_reason})"

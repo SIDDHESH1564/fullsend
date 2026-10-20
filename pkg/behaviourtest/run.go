@@ -104,6 +104,50 @@ func RunSuite(t *testing.T, opts SuiteOptions) {
 		Logf:         t.Logf,
 		FixturesRoot: opts.FixturesRoot,
 		RepoOwner:    org,
+		CLIBinary:    binary,
+	}
+
+	if outsiderPAT := os.Getenv("TEST_ACTOR_OUTSIDER_PAT"); outsiderPAT != "" {
+		outsiderClient := e2etest.NewLiveClient(outsiderPAT)
+		outsiderSCM, err := newSCMDriver(cfg.SCM, outsiderClient)
+		if err != nil {
+			t.Fatal(err)
+		}
+		template.OutsiderSCM = outsiderSCM
+		login, err := outsiderClient.GetAuthenticatedUser(ctx)
+		if err != nil {
+			t.Fatalf("resolving outsider login: %v", err)
+		}
+		template.OutsiderLogin = login
+	}
+
+	if writePAT := os.Getenv("TEST_ACTOR_WRITE_PAT"); writePAT != "" {
+		writeClient := e2etest.NewLiveClient(writePAT)
+		writeSCM, err := newSCMDriver(cfg.SCM, writeClient)
+		if err != nil {
+			t.Fatal(err)
+		}
+		template.WriteSCM = writeSCM
+		template.WriteToken = writePAT
+		login, err := writeClient.GetAuthenticatedUser(ctx)
+		if err != nil {
+			t.Fatalf("resolving write actor login: %v", err)
+		}
+		template.WriteLogin = login
+	}
+
+	if triagePAT := os.Getenv("TEST_ACTOR_TRIAGE_PAT"); triagePAT != "" {
+		triageClient := e2etest.NewLiveClient(triagePAT)
+		triageSCM, err := newSCMDriver(cfg.SCM, triageClient)
+		if err != nil {
+			t.Fatal(err)
+		}
+		template.TriageSCM = triageSCM
+		login, err := triageClient.GetAuthenticatedUser(ctx)
+		if err != nil {
+			t.Fatalf("resolving triage actor login: %v", err)
+		}
+		template.TriageLogin = login
 	}
 
 	suiteRunner := godog.TestSuite{

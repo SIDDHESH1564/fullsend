@@ -1050,16 +1050,91 @@ class TestEgressAllowlistParsing:
             result = hook._parse_egress_allowlist()
             assert ("2001:db8::1", 8443) in result
 
-    def test_wildcard_entries_ignored(self, hook, capsys):
+    def test_leading_wildcard_entries_accepted(self, hook):
         with mock.patch.dict(
             os.environ,
-            {"FULLSEND_EGRESS_ALLOWLIST": "*.internal:443,exact.host:8443"},
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443,exact.host:8443"},
+        ):
+            result = hook._parse_egress_allowlist()
+            assert len(result) == 2
+            assert ("*.atlassian.net", 443) in result
+            assert ("exact.host", 8443) in result
+
+    def test_bare_wildcard_rejected(self, hook, capsys):
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*:443,exact.host:8443"},
         ):
             result = hook._parse_egress_allowlist()
             assert len(result) == 1
             assert ("exact.host", 8443) in result
             captured = capsys.readouterr()
-            assert "wildcard entry '*.internal:443'" in captured.err
+            assert "wildcard entry '*:443'" in captured.err
+
+    def test_mid_string_glob_rejected(self, hook, capsys):
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "atl*an.net:443,exact.host:8443"},
+        ):
+            result = hook._parse_egress_allowlist()
+            assert len(result) == 1
+            assert ("exact.host", 8443) in result
+            captured = capsys.readouterr()
+            assert "wildcard entry 'atl*an.net:443'" in captured.err
+
+    def test_leading_wildcard_no_port(self, hook):
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net"},
+        ):
+            result = hook._parse_egress_allowlist()
+            assert ("*.atlassian.net", 0) in result
+
+    def test_trailing_dot_wildcard_collapses_rejected(self, hook, capsys):
+        """Trailing-dot collapse `*..:443` must not silently become (`*`, 443)."""
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*..:443,exact.host:8443"},
+        ):
+            result = hook._parse_egress_allowlist()
+            assert len(result) == 1
+            assert ("exact.host", 8443) in result
+            captured = capsys.readouterr()
+            assert "wildcard entry '*..:443'" in captured.err
+
+    def test_overly_broad_wildcard_rejected(self, hook, capsys):
+        """Overly broad pattern `*.com` (label depth < 2) is rejected with a warning."""
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.com:443,*.atlassian.net:443"},
+        ):
+            result = hook._parse_egress_allowlist()
+            # Only the specific pattern is accepted; *.com is rejected
+            assert ("*.com", 443) not in result
+            assert ("*.atlassian.net", 443) in result
+            assert len(result) == 1
+            captured = capsys.readouterr()
+            assert "overly broad" in captured.err
+            assert "*.com:443" in captured.err
+            # *.atlassian.net has depth >= 2, so no warning for it
+            assert "*.atlassian.net" not in captured.err
+
+    def test_multi_label_public_suffix_wildcard_accepted_known_limitation(self, hook, capsys):
+        """`*.co.uk` has depth >= 2 so it passes the overly-broad check and is
+        accepted, even though it spans many independently-controlled domains.
+        This is a documented, accepted residual risk (see
+        docs/contributing/runtime-implementation.md) rather than a bug: the
+        label-depth heuristic only filters single-label TLD wildcards like
+        `*.com`, not multi-label public suffixes.
+        """
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.co.uk:443"},
+        ):
+            result = hook._parse_egress_allowlist()
+            assert ("*.co.uk", 443) in result
+            captured = capsys.readouterr()
+            assert "overly broad" not in captured.err
 
     def test_malformed_port_warns(self, hook, capsys):
         with mock.patch.dict(
@@ -1072,6 +1147,131 @@ class TestEgressAllowlistParsing:
             captured = capsys.readouterr()
             assert "malformed port" in captured.err
             assert "host.internal:notaport" in captured.err
+
+    def test_wildcard_malformed_port_warns(self, hook, capsys):
+        """Wildcard entry with non-numeric port is rejected with a warning."""
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:notaport,good.host:443"},
+        ):
+            result = hook._parse_egress_allowlist()
+            assert len(result) == 1
+            assert ("good.host", 443) in result
+            captured = capsys.readouterr()
+            assert "malformed port" in captured.err
+            assert "*.atlassian.net:notaport" in captured.err
+
+
+class TestWildcardAllowlistMatching:
+    """Verify wildcard suffix matching in _is_host_allowlisted."""
+
+    def test_wildcard_matches_subdomain(self, hook):
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+        ):
+            assert hook._is_host_allowlisted("redhat.atlassian.net", 443) is True
+
+    def test_wildcard_matches_multi_level_subdomain(self, hook):
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+        ):
+            assert hook._is_host_allowlisted("sub.redhat.atlassian.net", 443) is True
+
+    def test_wildcard_does_not_match_base_domain(self, hook):
+        """Wildcard `*.atlassian.net` must not match atlassian.net (no subdomain)."""
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+        ):
+            assert hook._is_host_allowlisted("atlassian.net", 443) is False
+
+    def test_wildcard_does_not_match_suffix_spoof(self, hook):
+        """Wildcard `*.atlassian.net` must not match atlassian.net.evil.com."""
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+        ):
+            assert hook._is_host_allowlisted("atlassian.net.evil.com", 443) is False
+
+    def test_wildcard_does_not_match_label_prefix_lookalike(self, hook):
+        """Wildcard `*.atlassian.net` must not match `xatlassian.net` or
+        `notatlassian.net` — these share a suffix as raw characters
+        (`tlassian.net`) but not as a dot-delimited label boundary. A
+        regression that dropped the leading dot from the match suffix (e.g.
+        matching on `entry_host[2:]` instead of `entry_host[1:]`) would
+        incorrectly allow these.
+        """
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+        ):
+            assert hook._is_host_allowlisted("xatlassian.net", 443) is False
+            assert hook._is_host_allowlisted("notatlassian.net", 443) is False
+
+    def test_wildcard_does_not_match_suffix_spoof_with_label_boundary(self, hook):
+        """Wildcard `*.atlassian.net` must not match `foo.atlassian.net.evil.com`
+        or `notatlassian.net.attacker.com` — both contain `.atlassian.net`
+        (or a lookalike) as a substring but not as a trailing suffix. A
+        regression that used substring containment instead of `str.endswith`
+        would incorrectly allow these.
+        """
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+        ):
+            assert hook._is_host_allowlisted("foo.atlassian.net.evil.com", 443) is False
+            assert hook._is_host_allowlisted("notatlassian.net.attacker.com", 443) is False
+
+    def test_wildcard_port_must_match(self, hook):
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+        ):
+            assert hook._is_host_allowlisted("redhat.atlassian.net", 8080) is False
+
+    def test_wildcard_port_zero_matches_any(self, hook):
+        """Wildcard entry without port matches any port."""
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net"},
+        ):
+            assert hook._is_host_allowlisted("redhat.atlassian.net", 443) is True
+            assert hook._is_host_allowlisted("redhat.atlassian.net", 8080) is True
+
+    def test_bare_wildcard_does_not_match(self, hook, capsys):
+        """Bare * must not match any hostname."""
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*:443"},
+        ):
+            assert hook._is_host_allowlisted("anything.com", 443) is False
+            # Consume warning output
+            capsys.readouterr()
+
+    def test_mid_string_glob_does_not_match(self, hook, capsys):
+        """Mid-string globs like atl*an.net must not match."""
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "atl*an.net:443"},
+        ):
+            assert hook._is_host_allowlisted("atlassian.net", 443) is False
+            capsys.readouterr()
+
+    def test_wildcard_case_insensitive(self, hook):
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.Atlassian.NET:443"},
+        ):
+            assert hook._is_host_allowlisted("Redhat.ATLASSIAN.net", 443) is True
+
+    def test_wildcard_trailing_dot_stripped(self, hook):
+        with mock.patch.dict(
+            os.environ,
+            {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net.:443"},
+        ):
+            assert hook._is_host_allowlisted("redhat.atlassian.net", 443) is True
 
 
 class TestEgressAllowlistValidateUrl:
@@ -1198,6 +1398,210 @@ class TestEgressAllowlistValidateUrl:
         ):
             result = hook.validate_url(url)
             assert result is None  # allowed
+
+    def test_wildcard_allowlist_allows_subdomain_on_dns_failure(self, hook):
+        """Wildcard *.atlassian.net:443 allows redhat.atlassian.net when DNS fails."""
+        url = "https://redhat.atlassian.net/rest/api/2/issue/PROJ-1"
+        with (
+            mock.patch("socket.getaddrinfo", side_effect=socket.gaierror("no DNS")),
+            mock.patch.dict(
+                os.environ,
+                {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+            ),
+        ):
+            result = hook.validate_url(url)
+            assert result is None  # allowed
+
+    def test_wildcard_allowlist_blocks_base_domain_on_dns_failure(self, hook):
+        """Wildcard *.atlassian.net must not match the bare domain atlassian.net."""
+        url = "https://atlassian.net/something"
+        with (
+            mock.patch("socket.getaddrinfo", side_effect=socket.gaierror("no DNS")),
+            mock.patch.dict(
+                os.environ,
+                {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+            ),
+        ):
+            result = hook.validate_url(url)
+            assert result is not None
+            assert "fail-closed" in result
+
+    def test_wildcard_allowlist_blocks_wrong_port_on_dns_failure(self, hook):
+        """Wildcard on port 443 must not match port 8080."""
+        url = "https://redhat.atlassian.net:8080/api"
+        with (
+            mock.patch("socket.getaddrinfo", side_effect=socket.gaierror("no DNS")),
+            mock.patch.dict(
+                os.environ,
+                {"FULLSEND_EGRESS_ALLOWLIST": "*.atlassian.net:443"},
+            ),
+        ):
+            result = hook.validate_url(url)
+            assert result is not None
+            assert "fail-closed" in result
+
+
+_real_getaddrinfo = socket.getaddrinfo
+
+_IN_SANDBOX = {"OPENSHELL_SANDBOX": "1"}
+
+
+def _addrinfo(*ips: str) -> list:
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0)) for ip in ips]
+
+
+def _resolver(ips: list[str], policy_local: list[str] | None = None):
+    """Fake getaddrinfo: numeric lookups stay real, ``policy.local`` answers as
+    OpenShell policy DNS does (or not at all when *policy_local* is None), and
+    every other name answers *ips*."""
+
+    def fake(host, port, *args, **kwargs):
+        if kwargs.get("flags", 0) & socket.AI_NUMERICHOST:
+            return _real_getaddrinfo(host, port, *args, **kwargs)
+        if host == "policy.local":
+            if policy_local is None:
+                raise socket.gaierror("no policy DNS")
+            return _addrinfo(*policy_local)
+        return _addrinfo(*ips)
+
+    return fake
+
+
+class TestOpenShellPolicyDns:
+    """Synthetic policy-DNS answers defer to the OpenShell supervisor (#8016)."""
+
+    def _validate(self, hook, url, ips, env=_IN_SANDBOX, policy_local=("198.18.0.1",)):
+        pl = list(policy_local) if policy_local is not None else None
+        with (
+            mock.patch("socket.getaddrinfo", side_effect=_resolver(ips, pl)),
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(hook, "log_finding") as log,
+        ):
+            return hook.validate_url(url), log
+
+    def test_name_with_synthetic_answer_deferred_in_sandbox(self, hook):
+        result, log = self._validate(
+            hook, "https://github.com/o/r/issues/1", ["198.18.0.6", "198.18.0.7"]
+        )
+        assert result is None
+        assert log.call_args.kwargs["name"] == "openshell_policy_dns_defer"
+
+    def test_blocked_outside_sandbox(self, hook):
+        result, _ = self._validate(hook, "https://github.com/", ["198.18.0.6"], env={})
+        assert result is not None and "private" in result
+
+    def test_empty_sandbox_marker_blocks(self, hook):
+        result, _ = self._validate(
+            hook, "https://github.com/", ["198.18.0.6"], env={"OPENSHELL_SANDBOX": ""}
+        )
+        assert result is not None and "private" in result
+
+    @pytest.mark.parametrize("policy_local", [None, ("198.18.0.9",), ("198.18.0.1", "10.0.0.1")])
+    def test_blocked_when_policy_dns_not_answering(self, hook, policy_local):
+        result, _ = self._validate(
+            hook, "https://github.com/", ["198.18.0.6"], policy_local=policy_local
+        )
+        assert result is not None and "private" in result
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "198.18.0.6",
+            "[::ffff:198.18.0.6]",
+            "3323068422",  # 198.18.0.6
+            "3323068417",  # 198.18.0.1, policy.local's address
+            "198.18.1",
+            "0xc6120006",
+            "0306.022.0.6",
+            "198.022.0.6",  # octal 022 is decimal 18
+        ],
+    )
+    def test_ip_literal_spellings_blocked_in_sandbox(self, hook, host):
+        result, log = self._validate(hook, f"http://{host}/", ["198.18.0.6"])
+        assert result is not None
+        log.assert_not_called()
+
+    def test_invalid_octal_spelling_is_hostname_deferred_in_sandbox(self, hook):
+        # "018" is not valid octal, so neither the numeric resolver nor libcurl
+        # treats 198.018.0.6 as an IP literal; it takes the hostname path.
+        result, log = self._validate(hook, "http://198.018.0.6/", ["198.18.0.6"])
+        assert result is None
+        assert log.call_args.kwargs["name"] == "openshell_policy_dns_defer"
+
+    @pytest.mark.parametrize(
+        "ips",
+        [["198.18.0.6", "10.0.0.5"], ["10.0.0.5"], ["192.168.1.1"], ["127.0.0.1"], ["100.64.0.1"]],
+    )
+    def test_answer_outside_synthetic_pool_blocked_in_sandbox(self, hook, ips):
+        result, _ = self._validate(hook, "https://internal.example/", ips)
+        assert result is not None and "DNS rebinding" in result
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "policy.local",
+            "POLICY.LOCAL.",
+            "host.openshell.internal",
+            "host.docker.internal",
+            "Host.Containers.Internal",
+            "ｐｏｌｉｃｙ.local",  # fullwidth
+            "policy。local",  # ideographic full stop
+            "hoſt.docker.internal",  # long s folds to s
+        ],
+    )
+    def test_openshell_internal_names_blocked_in_sandbox(self, hook, host):
+        result, _ = self._validate(hook, f"http://{host}/", ["198.18.0.6"])
+        assert result is not None
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "metadata。google.internal",  # ideographic full stop
+            "ｍｅｔａｄａｔａ.google.internal",  # fullwidth
+            "ｍｅｔａｄａｔａ.goog",
+        ],
+    )
+    def test_blocked_hostname_idna_variants_never_deferred(self, hook, host):
+        result, log = self._validate(hook, f"http://{host}/", ["198.18.0.6"])
+        assert result is not None
+        log.assert_not_called()
+
+    def test_policy_local_address_never_deferred(self, hook):
+        result, _ = self._validate(hook, "http://any-name.example/", ["198.18.0.1"])
+        assert result is not None
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://metadata.google.internal/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/",
+        ],
+    )
+    def test_metadata_and_private_literals_blocked_in_sandbox(self, hook, url):
+        result, _ = self._validate(hook, url, ["198.18.0.6"])
+        assert result is not None
+
+    def _process(self, hook, command):
+        with (
+            mock.patch("socket.getaddrinfo", side_effect=_resolver(["198.18.0.6"], ["198.18.0.1"])),
+            mock.patch.dict(os.environ, _IN_SANDBOX, clear=True),
+            mock.patch.object(hook, "log_finding"),
+        ):
+            return hook.process_tool_call({"tool_name": "Bash", "tool_input": {"command": command}})
+
+    def test_issue_8016_result_write_allowed_in_sandbox(self, hook):
+        command = (
+            'mkdir -p "$FULLSEND_OUTPUT_DIR" && '
+            "cat > \"$FULLSEND_OUTPUT_DIR/agent-result.json\" <<'EOF'\n"
+            '{"comment": "Blocked on https://github.com/fullsend-ai/fullsend/issues/8010"}\n'
+            "EOF"
+        )
+        assert self._process(hook, command) is None
+
+    def test_heredoc_with_metadata_url_still_blocked_in_sandbox(self, hook):
+        command = "cat > out <<'EOF'\nhttp://169.254.169.254/latest/meta-data/\nEOF"
+        assert self._process(hook, command) is not None
 
 
 # ===========================================================================

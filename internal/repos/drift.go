@@ -37,8 +37,9 @@ type ContentDriftFile struct {
 // Both the status and converge paths use this function so they share
 // the same comparison logic and cannot diverge.
 //
-// Files that are not found on the forge are skipped — presence drift
-// is detected separately by ProbeComponents.
+// Missing workflow and thin-caller files are handled by ProbeComponents;
+// auxiliary scaffold files with forge-specific health semantics are also
+// checked there.
 func CheckFileContentDrift(ctx context.Context, client forge.Client,
 	owner, repo string, fc ForgeConfig, forgeName string,
 	expectedFiles []forge.TreeFile) ([]ContentDriftFile, error) {
@@ -46,9 +47,12 @@ func CheckFileContentDrift(ctx context.Context, client forge.Client,
 	var drifted []ContentDriftFile
 
 	for _, ef := range expectedFiles {
-		// Skip config.yaml — role configuration is not tracked by
-		// drift detection.
-		if ef.Path == ".fullsend/config.yaml" {
+		// Skip config.yaml and base config files. An unmanaged
+		// config.yaml is owned by the repository; managed-configuration
+		// drift is compared against the canonical rendered configuration,
+		// and base-file drift against the declared preset — not against
+		// BuildScaffoldFiles.
+		if ef.Path == ".fullsend/config.yaml" || ef.Path == ".fullsend/config.base.yaml" {
 			continue
 		}
 
@@ -80,6 +84,17 @@ func CheckFileContentDrift(ctx context.Context, client forge.Client,
 		if installed == nil {
 			// File not found — presence drift is handled by
 			// ProbeComponents; content comparison not applicable.
+			// Exception: the GitLab webhook dispatcher files are probed
+			// only when the installed wrapper already references them, so
+			// a rollout that is about to rewrite the wrapper must deliver
+			// them here when the selected version's scaffold includes them.
+			if forgeName == ForgeGitLab && slices.Contains(gitlabDispatcherPaths(), ef.Path) {
+				drifted = append(drifted, ContentDriftFile{
+					Path:          ef.Path,
+					InstalledPath: ef.Path,
+					Expected:      ef.Content,
+				})
+			}
 			continue
 		}
 
@@ -166,7 +181,10 @@ type OrphanVar struct {
 // CheckOrphanVars lists all repository variables on the forge and returns
 // those with the FULLSEND_ prefix that are not in the managed variable set
 // for the given forge. These are orphan variables — leftover from a
-// previous installation or a removed feature.
+// previous installation or a removed feature. GitLab retired poll-state
+// variables (gitlabRetiredLegacyVars) are known-retired: they are not
+// reported as orphans so already-installed repos do not warn during the
+// migrate-then-delete transition.
 //
 // The managed set is computed using the FULL superset of possible
 // managed variables — conditional fields (InferenceRegion,
@@ -185,6 +203,9 @@ func CheckOrphanVars(ctx context.Context, client forge.Client,
 	if maxCfg.ReviewAppClientID == "" {
 		maxCfg.ReviewAppClientID = "placeholder"
 	}
+	if maxCfg.AppSet == "" {
+		maxCfg.AppSet = "placeholder"
+	}
 	managed, err := managedVarsForForge(maxCfg, mintURL)
 	if err != nil {
 		return nil, err
@@ -198,8 +219,27 @@ func CheckOrphanVars(ctx context.Context, client forge.Client,
 	// On GitLab, secrets are stored as masked CI/CD variables, so
 	// ListRepoVariables returns them. Exclude required secrets from
 	// orphan detection — they are not orphans.
-	for _, s := range requiredSecretsForForge(cfg.Forge) {
+	// Inference secrets of every auth method are managed.
+	for _, s := range managedInferenceSecrets() {
 		managedNames[s] = true
+	}
+	// FULLSEND_DISPATCH_SECRET is auto-provisioned by install/converge
+	// to sign poll state. It is managed, not an orphan, but is
+	// intentionally not in requiredSecretsForForge — that would mark
+	// existing installs incomplete solely because the secret is new.
+	if cfg.Forge == ForgeGitLab {
+		managedNames[forge.SecretDispatch] = true
+		// The webhook fast path owns its pipeline trigger token and webhook
+		// secret. They are stored as masked CI/CD variables, so the variable
+		// listing returns them, but they are managed, not orphans.
+		managedNames[forge.SecretTriggerToken] = true
+		managedNames[forge.SecretWebhookSecret] = true
+		for _, name := range gitlabRetiredLegacyVars {
+			managedNames[name] = true
+		}
+		for _, name := range gitLabRoleUninstallVars {
+			managedNames[name] = true
+		}
 	}
 
 	forgeVars, err := client.ListRepoVariables(ctx, owner, repo)
@@ -213,6 +253,24 @@ func CheckOrphanVars(ctx context.Context, client forge.Client,
 			continue
 		}
 		if managedNames[name] {
+			continue
+		}
+		// OpenAI WIF identifiers are a user-provided identifier source:
+		// supported, but not installer-owned. They configure the OpenAI
+		// provider for openai-wif repositories and for OpenAI WIF
+		// sub-agents of a vertex-wif parent, where they do not override
+		// the Vertex authentication. On an openai-api-key route they are
+		// retained drift: the runtime would still prefer them over the key.
+		if (cfg.InferenceAuth == InferenceAuthOpenAIWIF || cfg.InferenceAuth == InferenceAuthVertexWIF) &&
+			slices.Contains(openAIWIFVariables, name) {
+			continue
+		}
+		if cfg.Forge == ForgeGitLab && IsGitLabRoleManagedVar(name) {
+			continue
+		}
+		// The transient installer lease is not an orphan while a concurrent
+		// install holds it.
+		if cfg.Forge == ForgeGitLab && name == GitLabProjectLeaseVar {
 			continue
 		}
 		orphans = append(orphans, OrphanVar{Name: name})

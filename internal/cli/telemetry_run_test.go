@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -24,6 +25,8 @@ import (
 
 	"github.com/fullsend-ai/fullsend/internal/evalmeasure"
 	"github.com/fullsend-ai/fullsend/internal/fetch"
+	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/harness"
 	agentruntime "github.com/fullsend-ai/fullsend/internal/runtime"
 	"github.com/fullsend-ai/fullsend/internal/security"
 	"github.com/fullsend-ai/fullsend/internal/telemetry"
@@ -286,6 +289,33 @@ func TestChildScriptEnv_StripsOIDCVars(t *testing.T) {
 	assert.True(t, hasRunner, "RunnerEnv var must survive")
 }
 
+func TestChildScriptEnv_StripsWorkflowToken(t *testing.T) {
+	t.Setenv(workflowTokenEnv, "ghs_workflow_token_value_xx")
+	t.Setenv("SAFE_VAR", "should-survive")
+
+	env := childScriptEnv(map[string]string{"RUNNER_VAR": "present"}, "")
+
+	for _, e := range env {
+		key := e
+		if i := strings.IndexByte(e, '='); i > 0 {
+			key = e[:i]
+		}
+		assert.NotEqual(t, workflowTokenEnv, key, "GH_WORKFLOW_TOKEN must be stripped from child script env")
+	}
+
+	hasSafe, hasRunner := false, false
+	for _, e := range env {
+		if e == "SAFE_VAR=should-survive" {
+			hasSafe = true
+		}
+		if e == "RUNNER_VAR=present" {
+			hasRunner = true
+		}
+	}
+	assert.True(t, hasSafe, "non-denied process env var must survive")
+	assert.True(t, hasRunner, "RunnerEnv var must survive")
+}
+
 // TestChildScriptEnv_StripsOIDCFromRunnerEnv verifies that OIDC credential
 // vars injected via RunnerEnv are also stripped (#5832).
 func TestChildScriptEnv_StripsOIDCFromRunnerEnv(t *testing.T) {
@@ -317,6 +347,213 @@ func TestChildScriptEnv_StripsOIDCFromRunnerEnv(t *testing.T) {
 		}
 	}
 	assert.True(t, hasLegit, "non-OIDC RunnerEnv var must survive")
+}
+
+// TestChildScriptEnv_PinsGitLabRoleRoutingKeys verifies the auth-bypass fix
+// from the review on PR #7510: a harness runner_env/env.runner entry for a
+// GitLab role-routing key must not shadow the value
+// applyGitLabRoleSelection already set in the process environment, since
+// exec.Cmd resolves duplicate env keys last-wins.
+func TestChildScriptEnv_PinsGitLabRoleRoutingKeys(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "process-selected-token")
+	t.Setenv(forge.SecretForgeToken, "process-shared-token")
+	t.Setenv(forge.SecretGitLabAnalystToken, "process-analyst-token")
+
+	runnerEnv := map[string]string{
+		"GITLAB_TOKEN":                 "runner-env-override",
+		forge.SecretForgeToken:         "runner-env-override",
+		forge.SecretGitLabAnalystToken: "runner-env-override",
+		"LEGIT_VAR":                    "allowed",
+	}
+
+	env := childScriptEnv(runnerEnv, "")
+
+	assert.Equal(t, "process-selected-token", envLast(env, "GITLAB_TOKEN"), "runner_env must not override GITLAB_TOKEN")
+	assert.Equal(t, "process-shared-token", envLast(env, forge.SecretForgeToken), "runner_env must not override FULLSEND_FORGE_TOKEN")
+	assert.Equal(t, "process-analyst-token", envLast(env, forge.SecretGitLabAnalystToken), "runner_env must not override a FULLSEND_GITLAB_* secret")
+	assert.Equal(t, "allowed", envLast(env, "LEGIT_VAR"), "non-pinned runner_env entries still apply")
+}
+
+// TestChildScriptEnv_DoesNotPinPushToken verifies the GitHub coder-remint
+// path (syncRunnerEnvTokens, #7231) still works: PUSH_TOKEN is deliberately
+// excluded from the GitLab role-routing pin because runner_env must be able
+// to override a stale process-env PUSH_TOKEN after a remint.
+func TestChildScriptEnv_DoesNotPinPushToken(t *testing.T) {
+	t.Setenv("PUSH_TOKEN", "stale-process-token")
+
+	env := childScriptEnv(map[string]string{"PUSH_TOKEN": "reminted-token"}, "")
+
+	assert.Equal(t, "reminted-token", envLast(env, "PUSH_TOKEN"), "runner_env must still be able to override PUSH_TOKEN (#7231)")
+}
+
+// setInheritedScriptSecrets sets the named workflow secrets from #8154 in the
+// process environment, plus non-secret OTEL settings that must survive.
+func setInheritedScriptSecrets(t *testing.T) {
+	t.Helper()
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer%20collector")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "Authorization=Bearer%20traces")
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_HEADERS", "Authorization=Bearer%20metrics")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example.com")
+	t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", "/tmp/collector.pem")
+	t.Setenv("JIRA_TOKEN", "process-jira-token")
+	t.Setenv("JIRA_USER_EMAIL", "bot@example.com")
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+}
+
+func envHasKey(env []string, key string) bool {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestChildScriptEnv_StripsInheritedNamedSecrets verifies that named
+// workflow secrets set on the `fullsend run` step do not reach host-side
+// scripts unless the harness declares them (#8154).
+func TestChildScriptEnv_StripsInheritedNamedSecrets(t *testing.T) {
+	setInheritedScriptSecrets(t)
+
+	env := childScriptEnv(map[string]string{"RUNNER_VAR": "present"}, "")
+
+	for _, key := range []string{
+		"OTEL_EXPORTER_OTLP_HEADERS",
+		"OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+		"OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+		"JIRA_TOKEN",
+		"JIRA_USER_EMAIL",
+	} {
+		assert.False(t, envHasKey(env, key), "%s must not be inherited by child scripts", key)
+	}
+	assert.Equal(t, "https://collector.example.com", envLast(env, "OTEL_EXPORTER_OTLP_ENDPOINT"), "non-secret OTEL settings must survive")
+	assert.Equal(t, "/tmp/collector.pem", envLast(env, "OTEL_EXPORTER_OTLP_CERTIFICATE"), "non-secret OTEL settings must survive")
+	assert.Equal(t, "https://acme.atlassian.net", envLast(env, "JIRA_BASE_URL"), "JIRA_BASE_URL is not a secret and must survive")
+	assert.Equal(t, "present", envLast(env, "RUNNER_VAR"))
+
+	// The parent process keeps them for its own Jira client and exporter.
+	assert.Equal(t, "process-jira-token", os.Getenv("JIRA_TOKEN"))
+	assert.Equal(t, "Authorization=Bearer%20traces", os.Getenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS"))
+}
+
+// TestChildScriptEnv_KeepsDeclaredNamedSecrets verifies that a harness that
+// declares a named secret in env.runner still passes it to its scripts.
+func TestChildScriptEnv_KeepsDeclaredNamedSecrets(t *testing.T) {
+	setInheritedScriptSecrets(t)
+
+	env := childScriptEnv(map[string]string{
+		"JIRA_TOKEN":      "process-jira-token",
+		"JIRA_USER_EMAIL": "bot@example.com",
+	}, "")
+
+	assert.Equal(t, "process-jira-token", envLast(env, "JIRA_TOKEN"), "declared JIRA_TOKEN must reach the script")
+	assert.Equal(t, "bot@example.com", envLast(env, "JIRA_USER_EMAIL"), "declared JIRA_USER_EMAIL must reach the script")
+	assert.False(t, envHasKey(env, "OTEL_EXPORTER_OTLP_HEADERS"), "undeclared OTLP headers must still be stripped")
+}
+
+// TestPostScriptEnv_StripsInheritedNamedSecrets covers the post-script path.
+func TestPostScriptEnv_StripsInheritedNamedSecrets(t *testing.T) {
+	setInheritedScriptSecrets(t)
+
+	env := postScriptEnv(&harness.Harness{RunnerEnv: map[string]string{"JIRA_TOKEN": "declared"}}, "")
+
+	assert.Equal(t, "declared", envLast(env, "JIRA_TOKEN"))
+	assert.False(t, envHasKey(env, "JIRA_USER_EMAIL"))
+	assert.False(t, envHasKey(env, "OTEL_EXPORTER_OTLP_HEADERS"))
+	assert.False(t, envHasKey(env, "OTEL_EXPORTER_OTLP_TRACES_HEADERS"))
+}
+
+// TestValidationScriptEnv_StripsInheritedNamedSecrets covers the validation
+// loop path, which composes its env separately from childScriptEnv.
+func TestValidationScriptEnv_StripsInheritedNamedSecrets(t *testing.T) {
+	setInheritedScriptSecrets(t)
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "oidc-token")
+
+	env := validationScriptEnv(&harness.Harness{RunnerEnv: map[string]string{
+		"JIRA_USER_EMAIL": "declared@example.com",
+	}}, "/repo", "/run")
+
+	for _, key := range []string{
+		"OTEL_EXPORTER_OTLP_HEADERS",
+		"OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+		"JIRA_TOKEN",
+		"ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+	} {
+		assert.False(t, envHasKey(env, key), "%s must not reach the validation script", key)
+	}
+	assert.Equal(t, "declared@example.com", envLast(env, "JIRA_USER_EMAIL"), "declared value must reach the validation script")
+	assert.Equal(t, "https://collector.example.com", envLast(env, "OTEL_EXPORTER_OTLP_ENDPOINT"))
+	assert.Equal(t, "/repo", envLast(env, "TARGET_REPO_DIR"))
+	assert.Equal(t, "/run", envLast(env, "FULLSEND_RUN_DIR"))
+}
+
+// envCount returns how many entries in env set key.
+func envCount(env []string, key string) int {
+	n := 0
+	for _, e := range env {
+		if strings.HasPrefix(e, key+"=") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestScriptEnvs_ForcePythonDontWriteBytecode verifies every host-side script
+// env sets PYTHONDONTWRITEBYTECODE=1 exactly once, overriding other sources (#7137).
+func TestScriptEnvs_ForcePythonDontWriteBytecode(t *testing.T) {
+	t.Setenv("PYTHONDONTWRITEBYTECODE", "")
+	runnerEnv := map[string]string{"PYTHONDONTWRITEBYTECODE": "", "FOO": "bar"}
+
+	for name, env := range map[string][]string{
+		"childScriptEnv":      childScriptEnv(runnerEnv, ""),
+		"postScriptEnv":       postScriptEnv(&harness.Harness{RunnerEnv: runnerEnv}, ""),
+		"validationScriptEnv": validationScriptEnv(&harness.Harness{RunnerEnv: runnerEnv}, "/repo", "/run"),
+	} {
+		assert.Equal(t, 1, envCount(env, "PYTHONDONTWRITEBYTECODE"), "%s: exactly one PYTHONDONTWRITEBYTECODE entry", name)
+		assert.Equal(t, "1", envLast(env, "PYTHONDONTWRITEBYTECODE"), "%s: PYTHONDONTWRITEBYTECODE must be forced on", name)
+		assert.Equal(t, "bar", envLast(env, "FOO"), "%s: other runner_env entries preserved", name)
+	}
+}
+
+// TestChildScriptEnv_PythonWritesNoBytecode checks that a Python script importing
+// a sibling module leaves no __pycache__ behind under the child script env (#7137).
+func TestChildScriptEnv_PythonWritesNoBytecode(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+	t.Setenv("PYTHONDONTWRITEBYTECODE", "")
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "helper.py"), []byte("VALUE = 1\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.py"), []byte("import helper\nprint(helper.VALUE)\n"), 0o644))
+
+	cmd := exec.Command(python, filepath.Join(dir, "main.py"))
+	cmd.Dir = dir
+	cmd.Env = childScriptEnv(map[string]string{}, "")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	_, statErr := os.Stat(filepath.Join(dir, "__pycache__"))
+	assert.True(t, os.IsNotExist(statErr), "python must not write __pycache__ into the script directory")
+}
+
+func TestIsInheritedScriptDenyKey(t *testing.T) {
+	for key, want := range map[string]bool{
+		"JIRA_TOKEN":                        true,
+		"JIRA_USER_EMAIL":                   true,
+		"OTEL_EXPORTER_OTLP_HEADERS":        true,
+		"OTEL_EXPORTER_OTLP_TRACES_HEADERS": true,
+		"OTEL_EXPORTER_OTLP_LOGS_HEADERS":   true,
+		"OTEL_EXPORTER_OTLP_ENDPOINT":       false,
+		"OTEL_EXPORTER_OTLP_PROTOCOL":       false,
+		"OTEL_RESOURCE_ATTRIBUTES":          false,
+		"JIRA_BASE_URL":                     false,
+		"GH_TOKEN":                          false,
+	} {
+		assert.Equal(t, want, isInheritedScriptDenyKey(key), key)
+	}
 }
 
 func TestAgentSpanStartAttrs(t *testing.T) {
@@ -360,6 +597,7 @@ func TestAgentSpanEndAttrs(t *testing.T) {
 	assert.Contains(t, a, attribute.Int("iteration", 2))
 	assert.Contains(t, a, attribute.Int("exit_code", 0))
 	assert.Contains(t, a, attribute.String("gen_ai.system", "anthropic"))
+	assert.Contains(t, a, attribute.String("gen_ai.provider.name", "anthropic"))
 	assert.Contains(t, a, attribute.String("gen_ai.request.model", "claude-opus-4-6"))
 	assert.Contains(t, a, attribute.String("fullsend.runtime", "claude"))
 	assert.Contains(t, a, attribute.Int("gen_ai.usage.input_tokens", 11))
@@ -382,8 +620,60 @@ func TestAgentSpanEndAttrs_WithReasoningTokens(t *testing.T) {
 	m.ReasoningTokens = 42
 
 	a := agentSpanEndAttrs(1, 0, "anthropic", "claude", &m)
+	assert.Contains(t, a, attribute.String("gen_ai.provider.name", "anthropic"))
 	assert.Contains(t, a, attribute.Int("gen_ai.usage.reasoning_tokens", 42),
 		"reasoning_tokens attribute should be present when non-zero")
+}
+
+func TestAgentSpanEndAttrs_IdentityTuple(t *testing.T) {
+	// The identity tuple is (fullsend.runtime, provider, gen_ai.request.model).
+	// Claude and Pi on the same Anthropic model share the request model and
+	// differ in runtime; Pi's provider is the Vertex serving endpoint, not
+	// the runtime name. Other Pi endpoints must report that endpoint (#7245).
+	for _, tc := range []struct {
+		runtime  string
+		provider string
+		model    string
+	}{
+		{runtime: "claude", provider: "anthropic", model: "claude-sonnet-5"},
+		{runtime: "pi", provider: "anthropic-vertex", model: "claude-sonnet-5"},
+		{runtime: "pi", provider: "xai-vertex", model: "xai/grok-4.6"},
+		{runtime: "pi", provider: "google-vertex", model: "gemini-3.8-flash"},
+		{runtime: "pi", provider: "openai", model: "gpt-5.6-luna"},
+	} {
+		t.Run(tc.runtime+"/"+tc.provider+"/"+tc.model, func(t *testing.T) {
+			m := agentruntime.RunMetrics{Model: tc.model}
+			a := agentSpanEndAttrs(1, 0, tc.provider, tc.runtime, &m)
+			assert.Contains(t, a, attribute.String("fullsend.runtime", tc.runtime))
+			assert.Contains(t, a, attribute.String("gen_ai.system", tc.provider))
+			assert.Contains(t, a, attribute.String("gen_ai.provider.name", tc.provider))
+			assert.Contains(t, a, attribute.String("gen_ai.request.model", tc.model))
+			assert.NotContains(t, a, attribute.String("gen_ai.system", "pi"))
+		})
+	}
+}
+
+// TestAgentSpanEndAttrs_GenAISystemForWiring exercises the producer-to-
+// consumer path run.go actually uses: GenAISystemFor resolves the provider,
+// and that value (not rt.System()) is what agentSpanEndAttrs stamps onto
+// gen_ai.system / gen_ai.provider.name. TestAgentSpanEndAttrs_IdentityTuple
+// only checks agentSpanEndAttrs in isolation with hand-picked provider
+// strings, so it would not catch a regression where run.go goes back to
+// passing rt.System() ("pi") instead of calling GenAISystemFor (#7245).
+func TestAgentSpanEndAttrs_GenAISystemForWiring(t *testing.T) {
+	t.Setenv("FULLSEND_PI_PROVIDER", "")
+
+	rt := agentruntime.PiRuntime{}
+	genAISystem := agentruntime.GenAISystemFor(rt, "claude-sonnet-5", "", nil)
+	require.Equal(t, "anthropic-vertex", genAISystem,
+		"GenAISystemFor must resolve the serving endpoint via ProviderFor, not fall back to System()")
+
+	m := agentruntime.RunMetrics{Model: "claude-sonnet-5"}
+	a := agentSpanEndAttrs(1, 0, genAISystem, rt.Name(), &m)
+	assert.Contains(t, a, attribute.String("gen_ai.system", "anthropic-vertex"))
+	assert.Contains(t, a, attribute.String("gen_ai.provider.name", "anthropic-vertex"))
+	assert.NotContains(t, a, attribute.String("gen_ai.system", "pi"),
+		"a regression to rt.System() would stamp the runtime name instead of the resolved provider")
 }
 
 func TestAggregateRunMetrics(t *testing.T) {
@@ -440,6 +730,33 @@ func TestAggregateRunMetrics(t *testing.T) {
 // where only one iteration dispatched sub-agents is the case that breaks
 // if an iteration reports totals without also reporting its own entry, so
 // the pi runtime folds the parent entry on every iteration.
+// A fallback through the alias's chain (#8426) reaches metrics.json, and an
+// iteration that did not fall back does not erase an earlier one's record.
+func TestAggregateRunMetrics_FallbackFrom(t *testing.T) {
+	var agg aggregateMetrics
+	m1 := agentruntime.RunMetrics{Model: "claude-opus-4-6", FallbackFrom: []string{"claude-opus-5-5"}, FallbackReasons: []string{"not_served"}}
+	aggregateRunMetrics(&agg, &m1, 1)
+	m1.FallbackFrom[0] = "mutated"
+	m1.FallbackReasons[0] = "mutated"
+	assert.Equal(t, []string{"claude-opus-5-5"}, agg.FallbackFrom, "the aggregate keeps its own copy")
+	assert.Equal(t, []string{"not_served"}, agg.FallbackReasons, "the aggregate keeps its own copy")
+
+	m2 := agentruntime.RunMetrics{Model: "claude-opus-4-6"}
+	aggregateRunMetrics(&agg, &m2, 2)
+	assert.Equal(t, []string{"claude-opus-5-5"}, agg.FallbackFrom)
+	assert.Equal(t, []string{"not_served"}, agg.FallbackReasons)
+
+	data, err := json.Marshal(agg)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"fallback_from":["claude-opus-5-5"]`)
+	assert.Contains(t, string(data), `"fallback_reasons":["not_served"]`)
+
+	empty, err := json.Marshal(aggregateMetrics{})
+	require.NoError(t, err)
+	assert.NotContains(t, string(empty), "fallback_from", "absent when no iteration fell back")
+	assert.NotContains(t, string(empty), "fallback_reasons", "absent when no iteration fell back")
+}
+
 func TestAggregateRunMetrics_MixedIterations(t *testing.T) {
 	var agg aggregateMetrics
 
@@ -492,6 +809,7 @@ func TestResolveTraceIdentity_AdoptsSampledParent(t *testing.T) {
 	assert.Equal(t, trace.SpanKindConsumer, tid.SpanKind, "remote parent → Consumer kind")
 	assert.True(t, strings.HasSuffix(tid.Traceparent, "-01"), "sampled flag preserved")
 	assert.True(t, strings.HasPrefix(tid.Traceparent, "00-4f3a9c1b2d8e4a7c9f0b1e2d3c4a5b6d-"), "trace ID in propagated traceparent")
+	assert.True(t, tid.PropagatedFlags.IsSampled(), "sampled inbound keeps sampled flags")
 }
 
 func TestResolveTraceIdentity_PreservesUnsampledFlag(t *testing.T) {
@@ -505,6 +823,7 @@ func TestResolveTraceIdentity_PreservesUnsampledFlag(t *testing.T) {
 	assert.True(t, sc.IsSampled(), "local span still sampled for file exporter")
 	assert.True(t, strings.HasSuffix(tid.Traceparent, "-00"), "propagated traceparent must preserve unsampled flag")
 	assert.Equal(t, trace.SpanKindConsumer, tid.SpanKind)
+	assert.False(t, tid.PropagatedFlags.IsSampled(), "unsampled inbound must not re-advertise sampled")
 }
 
 func TestResolveTraceIdentity_NoInbound(t *testing.T) {
@@ -515,6 +834,65 @@ func TestResolveTraceIdentity_NoInbound(t *testing.T) {
 	require.True(t, sc.IsValid(), "root span must be valid")
 	assert.True(t, strings.HasSuffix(tid.Traceparent, "-01"), "fresh trace is sampled")
 	assert.Equal(t, trace.SpanKindInternal, tid.SpanKind, "no remote parent → Internal kind")
+	assert.True(t, tid.PropagatedFlags.IsSampled(), "fresh local trace is sampled")
+}
+
+func TestIterationTraceparent_PreservesUnsampledFlag(t *testing.T) {
+	const inbound = "00-4f3a9c1b2d8e4a7c9f0b1e2d3c4a5b6d-a1b2c3d4e5f60718-00"
+	tracer := testTracer()
+	tid := resolveTraceIdentity(context.Background(), tracer, inbound, "", nil)
+	defer tid.RootSpan.End()
+
+	_, agentSpan := tracer.Start(tid.Ctx, "agent")
+	defer agentSpan.End()
+
+	got := iterationTraceparent(agentSpan, tid.PropagatedFlags)
+	require.NotEmpty(t, got)
+	assert.True(t, strings.HasSuffix(got, "-00"), "runtime TRACEPARENT must keep the inbound unsampled flag, not AlwaysSample")
+	parts := strings.Split(got, "-")
+	require.Len(t, parts, 4)
+	assert.Equal(t, "4f3a9c1b2d8e4a7c9f0b1e2d3c4a5b6d", parts[1], "same trace ID")
+	agentID := agentSpan.SpanContext().SpanID().String()
+	rootID := tid.RootSpan.SpanContext().SpanID().String()
+	assert.Equal(t, agentID, parts[2], "span ID must be the agent span, not the run root")
+	assert.NotEqual(t, agentID, rootID)
+}
+
+func TestIterationTraceparent_SampledParent(t *testing.T) {
+	const inbound = "00-4f3a9c1b2d8e4a7c9f0b1e2d3c4a5b6d-a1b2c3d4e5f60718-01"
+	tracer := testTracer()
+	tid := resolveTraceIdentity(context.Background(), tracer, inbound, "", nil)
+	defer tid.RootSpan.End()
+
+	_, agentSpan := tracer.Start(tid.Ctx, "agent")
+	defer agentSpan.End()
+
+	got := iterationTraceparent(agentSpan, tid.PropagatedFlags)
+	require.NotEmpty(t, got)
+	assert.True(t, strings.HasSuffix(got, "-01"))
+	assert.Contains(t, got, agentSpan.SpanContext().SpanID().String())
+}
+
+func TestEndAgentSpanOnSetupError(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr), sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	_, span := tp.Tracer("test").Start(context.Background(), "agent")
+	endAgentSpanOnSetupError(span, errors.New("clearing stale iteration deadline"))
+
+	ended := sr.Ended()
+	require.Len(t, ended, 1)
+	assert.Equal(t, codes.Error, ended[0].Status().Code)
+	assert.Contains(t, ended[0].Status().Description, "clearing stale iteration deadline")
+}
+
+func TestSanitizeTraceparent(t *testing.T) {
+	const valid = "00-4f3a9c1b2d8e4a7c9f0b1e2d3c4a5b6d-a1b2c3d4e5f60718-01"
+	assert.Equal(t, valid, sanitizeTraceparent(valid))
+	assert.Equal(t, "", sanitizeTraceparent(""))
+	assert.Equal(t, "", sanitizeTraceparent("abc"))
+	assert.Equal(t, "", sanitizeTraceparent("00-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ-aaaaaaaaaaaaaaaa-01"))
+	assert.Equal(t, "", sanitizeTraceparent("'; rm -rf /; echo '"))
 }
 
 func TestResolveTraceIdentity_MalformedInput(t *testing.T) {
@@ -662,7 +1040,7 @@ func TestFinalizeAgentSpan(t *testing.T) {
 		tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
 		_, span := tp.Tracer("test").Start(context.Background(), "agent")
 		m := &agentruntime.RunMetrics{Model: "claude-opus-4-6"}
-		finalizeAgentSpan(span, runErr, 1, exitCode, "gcp.vertex_ai", "claude", m, transcriptErr)
+		finalizeAgentSpan(span, runErr, 1, exitCode, "gcp.vertex_ai", "claude", m, transcriptErr, nil)
 		ended := rec.Ended()
 		require.Len(t, ended, 1, "span must be ended exactly once")
 		return tracetest.SpanStubFromReadOnlySpan(ended[0])
@@ -740,7 +1118,7 @@ func TestFinalizeAgentSpan(t *testing.T) {
 		tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
 		_, span := tp.Tracer("test").Start(context.Background(), "agent")
 		m := &agentruntime.RunMetrics{Model: "claude-\xff\xfeopus"}
-		finalizeAgentSpan(span, nil, 1, 0, "gcp.vertex_ai", "claude", m, "")
+		finalizeAgentSpan(span, nil, 1, 0, "gcp.vertex_ai", "claude", m, "", nil)
 		ended := rec.Ended()
 		require.Len(t, ended, 1)
 		s := tracetest.SpanStubFromReadOnlySpan(ended[0])
@@ -754,6 +1132,42 @@ func TestFinalizeAgentSpan(t *testing.T) {
 		assert.Equal(t, codes.Error, s.Status.Code)
 		assert.Equal(t, "agent exited with code 1", s.Status.Description)
 	})
+	t.Run("finishes the tracker before ending the span", func(t *testing.T) {
+		rec := tracetest.NewSpanRecorder()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+		tracer := tp.Tracer("test")
+		agentCtx, agentSpan := tracer.Start(context.Background(), "agent")
+		tr := newToolSpanTracker(tracer, agentCtx)
+		for i := 0; i <= maxToolSpansPerIteration; i++ { // one past the cap: dropped == 1
+			tr.Handle(agentruntime.ToolUseEvent{ID: fmt.Sprintf("toolu_%05d", i), Name: "Bash"})
+		}
+
+		finalizeAgentSpan(agentSpan, nil, 1, 0, "anthropic", "claude", &agentruntime.RunMetrics{}, "", tr)
+
+		ended := rec.Ended()
+		require.Len(t, ended, maxToolSpansPerIteration+1, "every open tool span and the agent span end")
+		var agent sdktrace.ReadOnlySpan
+		for _, sp := range ended {
+			if sp.Name() == "agent" {
+				agent = sp
+			} else {
+				assert.False(t, sp.EndTime().After(agent0(ended).EndTime()), "tool spans end before their parent")
+				assert.Contains(t, sp.Attributes(), attribute.String("error.type", "unanswered"))
+			}
+		}
+		require.NotNil(t, agent)
+		assert.Contains(t, agent.Attributes(), attribute.Int("fullsend.tool_spans.dropped", 1), "overflow recorded on the agent span")
+	})
+}
+
+// agent0 returns the ended span named "agent" from rec.Ended().
+func agent0(spans []sdktrace.ReadOnlySpan) sdktrace.ReadOnlySpan {
+	for _, sp := range spans {
+		if sp.Name() == "agent" {
+			return sp
+		}
+	}
+	return nil
 }
 
 // TestHandleRunCancellation exercises the cancellation short-circuit
@@ -792,7 +1206,7 @@ func TestHandleRunCancellation(t *testing.T) {
 
 		cancelled, lastExitCode, err := handleRunCancellation(
 			ctx, nil, 2, 0, "anthropic", "claude",
-			metrics, buildAgg(), runDir, span, attach, printer, 1500*time.Millisecond,
+			metrics, buildAgg(), runDir, span, nil, attach, printer, 1500*time.Millisecond,
 		)
 
 		require.True(t, cancelled, "ctx.Err() is non-nil: the short-circuit must fire")
@@ -835,7 +1249,7 @@ func TestHandleRunCancellation(t *testing.T) {
 
 		cancelled, _, err := handleRunCancellation(
 			ctx, runErr, 1, -1, "anthropic", "claude",
-			metrics, buildAgg(), runDir, span, attach, printer, 0,
+			metrics, buildAgg(), runDir, span, nil, attach, printer, 0,
 		)
 
 		require.True(t, cancelled)
@@ -858,7 +1272,7 @@ func TestHandleRunCancellation(t *testing.T) {
 
 		cancelled, _, err := handleRunCancellation(
 			ctx, nil, 1, 0, "anthropic", "claude",
-			metrics, buildAgg(), runDir, span, attach, printer, 0,
+			metrics, buildAgg(), runDir, span, nil, attach, printer, 0,
 		)
 
 		assert.False(t, cancelled, "a live context must not trigger the short-circuit")
@@ -867,6 +1281,41 @@ func TestHandleRunCancellation(t *testing.T) {
 		assert.Empty(t, rec.Ended(), "the span must not be finalized when the run was not cancelled")
 		_, statErr := os.Stat(filepath.Join(runDir, metricsFile))
 		assert.True(t, os.IsNotExist(statErr), "metrics.json must not be written when the run was not cancelled")
+	})
+	t.Run("cancellation ends open tool spans as unanswered in the file sink", func(t *testing.T) {
+		// The stop path is the one where a call has no result by design;
+		// finalizeAgentSpan ends the tracker's open spans before the agent
+		// span, and the SimpleSpanProcessor file sink writes them on End,
+		// so they land even when SIGTERM kills the process before flush.
+		t.Setenv("OTEL_SDK_DISABLED", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
+		dir := t.TempDir()
+		tracer, cleanup := telemetry.Setup(dir, "test")
+		agentCtx, agentSpan := tracer.Start(context.Background(), "agent")
+		tr := newToolSpanTracker(tracer, agentCtx)
+		tr.Handle(agentruntime.ToolUseEvent{ID: "toolu_open", Name: "Bash"})
+		tr.dropped = 3 // an overflow must land on the agent span before it ends
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		cancelled, _, err := handleRunCancellation(
+			ctx, nil, 1, 0, "anthropic", "claude",
+			&agentruntime.RunMetrics{}, aggregateMetrics{}, t.TempDir(), agentSpan, tr, func(string) {}, ui.New(io.Discard), time.Second,
+		)
+		require.True(t, cancelled)
+		require.Error(t, err)
+		cleanup(context.Background())
+
+		raw, err := os.ReadFile(filepath.Join(dir, telemetry.TelemetryFile))
+		require.NoError(t, err)
+		content := string(raw)
+		assert.Contains(t, content, `"execute_tool Bash"`, "the open call's span must be ended and written")
+		assert.Contains(t, content, `"unanswered"`, "a call with no result at cancellation closes as error.type=unanswered")
+		parent, err := json.Marshal(agentSpan.SpanContext().SpanID().String())
+		require.NoError(t, err)
+		assert.Contains(t, content, `"parentSpanId":`+string(parent))
+		assert.Contains(t, content, `"fullsend.tool_spans.dropped"`, "the overflow is recorded before the agent span ends; an ended span drops attributes silently")
 	})
 }
 
@@ -1111,7 +1560,8 @@ func TestAttachContent_SetsContentAndMarkerAttrs(t *testing.T) {
 		OutputMessages: `[{"role":"assistant","parts":[{"type":"text","content":"hi"}]}]`,
 		DroppedBytes:   7,
 		Truncated:      true,
-		Findings:       []security.Finding{{Severity: "high"}},
+		Findings: []security.Finding{{Severity: "high"},
+			{Scanner: "unicode_normalizer", Name: "fullwidth"}, {Scanner: "unicode_normalizer", Name: "ansi_escape"}, {Scanner: "url", Name: "url_masked"}},
 	})
 	span.End()
 
@@ -1125,7 +1575,8 @@ func TestAttachContent_SetsContentAndMarkerAttrs(t *testing.T) {
 	assert.Contains(t, attrs[attribute.Key("gen_ai.output.messages")].AsString(), `"type":"text"`)
 	assert.Equal(t, int64(7), attrs[attribute.Key("fullsend.content.dropped_bytes")].AsInt64())
 	assert.True(t, attrs[attribute.Key("fullsend.content.truncated")].AsBool())
-	assert.Equal(t, int64(1), attrs[attribute.Key("fullsend.content.redactions")].AsInt64())
+	assert.Equal(t, int64(1), attrs[attribute.Key("fullsend.content.redactions")].AsInt64(), "only what matched a known secret")
+	assert.Equal(t, int64(3), attrs[attribute.Key("fullsend.content.sanitizations")].AsInt64(), "what was masked for its shape, apart")
 }
 
 func TestAttachContent_EmptyResultAddsNothing(t *testing.T) {
@@ -1191,15 +1642,10 @@ func TestAgentSpanEndAttrs_ModelBoundedWithoutSDKCap(t *testing.T) {
 	t.Fatal("gen_ai.request.model attribute not found")
 }
 
-func TestContentEventHandler_NilCollectorKeepsDefaultRenderer(t *testing.T) {
-	assert.Nil(t, contentEventHandler(func(agentruntime.AgentEvent) {}, nil),
-		"gate off must leave OnEvent nil so the runtime's default renderer runs")
-}
-
-func TestContentEventHandler_TeesToRendererAndCollector(t *testing.T) {
+func TestIterationEventHandler_TeesToRendererAndCollector(t *testing.T) {
 	var rendered []agentruntime.AgentEvent
 	c := newContentCollector(4096)
-	handler := contentEventHandler(func(e agentruntime.AgentEvent) { rendered = append(rendered, e) }, c)
+	handler := iterationEventHandler(func(e agentruntime.AgentEvent) { rendered = append(rendered, e) }, c, nil)
 	require.NotNil(t, handler)
 
 	handler(agentruntime.TextEvent{Text: "hello"})
@@ -1211,10 +1657,10 @@ func TestContentEventHandler_TeesToRendererAndCollector(t *testing.T) {
 
 func TestNewContentCollectorIfEnabled_FollowsGate(t *testing.T) {
 	t.Setenv(telemetry.ContentCaptureEnvVar, "")
-	assert.Nil(t, newContentCollectorIfEnabled(), "gate off => nil collector")
+	assert.Nil(t, newContentCollectorIfEnabled(nil), "gate off => nil collector")
 
 	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
-	assert.NotNil(t, newContentCollectorIfEnabled(), "gate on => live collector")
+	assert.NotNil(t, newContentCollectorIfEnabled(nil), "gate on => live collector")
 }
 
 // TestContentCapture_EndToEndFileSink drives the REAL telemetry.Setup —
@@ -1234,12 +1680,16 @@ func TestContentCapture_EndToEndFileSink(t *testing.T) {
 	dir := t.TempDir()
 	tracer, cleanup := telemetry.Setup(dir, "test")
 
-	c := newContentCollectorIfEnabled()
+	c := newContentCollectorIfEnabled(nil)
 	require.NotNil(t, c)
 	big := strings.Repeat("all work and no play makes claude a dull agent. ", 400) // ~19KB > 8192
+	c.Handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "Bash", Arguments: `{"command":"make lint"}`})
 	c.Handle(agentruntime.TextEvent{Text: big})
 
+	prompt, _ := buildFeedbackPrompt(strings.Repeat("the validator said no. ", 500)) // cut at 10 KiB > 8192
+
 	_, span := tracer.Start(context.Background(), "agent")
+	c.attachInput(span, prompt, false)
 	res := c.Result("stop")
 	attachContent(span, res)
 	span.End()
@@ -1249,9 +1699,18 @@ func TestContentCapture_EndToEndFileSink(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, raw)
 	content := string(raw)
+	require.Greater(t, len(prompt), telemetry.MaxSpanAttrValueLen)
+	promptJSON, err := json.Marshal(prompt)
+	require.NoError(t, err)
+	escapedInput, err := json.Marshal(`[{"role":"user","parts":[{"type":"text","content":` + string(promptJSON) + `}]}]`)
+	require.NoError(t, err)
+	require.Contains(t, content, "gen_ai.input.messages")
+	assert.Contains(t, content, string(escapedInput[1:len(escapedInput)-1]),
+		"the input record must appear byte-intact in the file sink")
 	require.Contains(t, content, "gen_ai.output.messages")
 	assert.Contains(t, content, "dull agent",
 		"content must reach the file sink")
+	assert.Contains(t, res.OutputMessages, `"arguments":{"command":"make lint"}`)
 	// The whole redacted content must survive — no SDK truncation at 8192.
 	var decoded []map[string]any
 	require.NoError(t, json.Unmarshal([]byte(res.OutputMessages), &decoded),
@@ -1265,8 +1724,8 @@ func TestContentCapture_EndToEndFileSink(t *testing.T) {
 }
 
 // TestContentCapture_GateOffProducesNoContent is the negative control: with
-// the gate off the collector is nil, OnEvent stays nil (default renderer),
-// and nothing content-shaped reaches the file sink.
+// the gate off the collector is nil and nothing content-shaped reaches the
+// file sink (tool spans are metadata and are emitted regardless).
 func TestContentCapture_GateOffProducesNoContent(t *testing.T) {
 	t.Setenv("OTEL_SDK_DISABLED", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
@@ -1278,17 +1737,26 @@ func TestContentCapture_GateOffProducesNoContent(t *testing.T) {
 	dir := t.TempDir()
 	tracer, cleanup := telemetry.Setup(dir, "test")
 
-	c := newContentCollectorIfEnabled()
+	c := newContentCollectorIfEnabled(nil)
 	require.Nil(t, c, "gate off must mean no collector")
 	c.Handle(agentruntime.TextEvent{Text: "would-be content"}) // nil-safe no-op
 
-	_, span := tracer.Start(context.Background(), "agent")
+	ctx, span := tracer.Start(context.Background(), "agent")
+	c.attachInput(span, "would-be prompt", false) // nil-safe no-op
+	handle := iterationEventHandler(func(agentruntime.AgentEvent) {}, c, newToolSpanTracker(tracer, ctx))
+	handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "Bash", Arguments: `{"command":"would-be arguments"}`})
+	handle(agentruntime.ToolResultEvent{ID: "toolu_01", Result: "would-be result"})
 	attachContent(span, c.Result("stop"))
 	span.End()
 	cleanup(context.Background())
 
 	raw, err := os.ReadFile(filepath.Join(dir, telemetry.TelemetryFile))
 	require.NoError(t, err)
+	assert.Contains(t, string(raw), "execute_tool Bash", "the tool span is metadata")
+	assert.NotContains(t, string(raw), "would-be arguments")
+	assert.NotContains(t, string(raw), "would-be result")
+	assert.NotContains(t, string(raw), "gen_ai.input.messages")
+	assert.NotContains(t, string(raw), "would-be prompt")
 	assert.NotContains(t, string(raw), "gen_ai.output.messages")
 	assert.NotContains(t, string(raw), "would-be content")
 	assert.NotContains(t, string(raw), "fullsend.content.")

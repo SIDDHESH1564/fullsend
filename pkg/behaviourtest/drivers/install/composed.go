@@ -26,6 +26,20 @@ type composedDriver struct {
 	// budget drained across the run (#6702).
 	rate forge.RateLimitReporter
 
+	// mintURL is the suite's mint URL, reported by MintURL. Set by the
+	// factories through withMintURL once the mint is deployed.
+	mintURL string
+
+	// traces, when set, is the job-scoped trace collector: each
+	// allocated repo is pointed at it, and Finalize stops it and
+	// saves its trace files. Set by withTraceCollector.
+	traces traceSink
+
+	// pendingTraces is a collector that failed to start and whose own
+	// cleanup also failed. It is never used to configure repos; Finalize
+	// only retries its cleanup.
+	pendingTraces interface{ Stop(context.Context) error }
+
 	names    chan string // buffered channel of available repo names
 	capacity int
 
@@ -47,6 +61,9 @@ func newComposedDriver(
 	if capacity <= 0 {
 		return nil, fmt.Errorf("composed driver: capacity must be positive, got %d", capacity)
 	}
+	if ensurer == nil {
+		return nil, errors.New("composed driver: ensurer must not be nil")
+	}
 	names := make(chan string, capacity)
 	for i := 1; i <= capacity; i++ {
 		names <- fmt.Sprintf("test-repo-%02d", i)
@@ -63,8 +80,8 @@ func newComposedDriver(
 }
 
 // AllocateRepo leases a slot from the internal pool and ensures the
-// repo is created and installed. Blocks until a slot is free or ctx
-// is cancelled.
+// repo is created and installed from a clean base (delete+recreate if
+// it already exists). Blocks until a slot is free or ctx is cancelled.
 func (d *composedDriver) AllocateRepo(ctx context.Context) (string, error) {
 	// Acquire a name from the pool (blocks if all slots are in use).
 	var name string
@@ -88,38 +105,61 @@ func (d *composedDriver) AllocateRepo(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("allocating repo %s/%s: %w", d.org, name, err)
 	}
 
+	if d.traces != nil {
+		if err := d.traces.ConfigureRepo(ctx, d.org, name); err != nil {
+			d.logf("[driver] trace collector: configuring %s/%s (continuing without traces from it): %v", d.org, name, err)
+		}
+	}
+
 	d.logf("[driver] allocated %s/%s", d.org, name)
 	d.logRateLimit("after allocating " + d.org + "/" + name)
 	return name, nil
 }
 
-// DeallocateRepo returns a previously allocated repo to the pool.
-// Errors on unknown name or double-release.
-func (d *composedDriver) DeallocateRepo(_ context.Context, repoName string) error {
+// DeallocateRepo deletes the leased pool base (best-effort) and returns
+// the name to the pool. Called from the After hook after CleanupScenario
+// and after in-scenario debug collection (workflow logs, agent
+// artifacts) so CI still has those files under BEHAVIOUR_ARTIFACT_DIR
+// once the forge repo is gone. Errors on unknown name or double-release.
+// A delete failure is logged; the name is still returned so the slot is
+// not leaked. The next AllocateRepo reset+recreates leftovers.
+func (d *composedDriver) DeallocateRepo(ctx context.Context, repoName string) error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	if _, ok := d.outstanding[repoName]; !ok {
+		d.mu.Unlock()
 		return fmt.Errorf("DeallocateRepo: %q is not an outstanding lease (possible double-release)", repoName)
 	}
 	delete(d.outstanding, repoName)
+	d.mu.Unlock()
+
+	if d.ensurer != nil {
+		if err := d.ensurer.DeleteRepo(ctx, d.org, repoName); err != nil {
+			d.logf("[driver] deleting leased repo %s/%s: %v", d.org, repoName, err)
+		}
+	}
+
+	d.mu.Lock()
 	// Send inside the lock: the channel buffer equals capacity and this
 	// name was removed during AllocateRepo, so the send is guaranteed
 	// non-blocking.
 	d.names <- repoName
 	d.logf("[driver] deallocated %s/%s", d.org, repoName)
+	d.mu.Unlock()
 	d.logRateLimit("after deallocating " + d.org + "/" + repoName)
 	return nil
 }
 
-// Finalize tears down suite-scoped resources (mint). If leases are
-// still outstanding, it reclaims them (logging the names) and returns
-// an error alongside any mint teardown error via errors.Join.
+// Finalize tears down suite-scoped resources (mint, trace collector).
+// If leases are still outstanding, it reclaims them (logging the names), best-effort
+// deletes each leaked repo (same log-and-continue policy as
+// DeallocateRepo, so a leak doesn't leave the forge repo behind until
+// the next acquire), and returns an error alongside any mint teardown
+// error via errors.Join.
 func (d *composedDriver) Finalize(ctx context.Context) error {
 	d.mu.Lock()
 	var leakErr error
+	leaked := make([]string, 0, len(d.outstanding))
 	if len(d.outstanding) > 0 {
-		leaked := make([]string, 0, len(d.outstanding))
 		for name := range d.outstanding {
 			leaked = append(leaked, name)
 		}
@@ -132,6 +172,12 @@ func (d *composedDriver) Finalize(ctx context.Context) error {
 	}
 	d.mu.Unlock()
 
+	for _, name := range leaked {
+		if err := d.ensurer.DeleteRepo(ctx, d.org, name); err != nil {
+			d.logf("[driver] Finalize: deleting leaked repo %s/%s: %v", d.org, name, err)
+		}
+	}
+
 	var teardownErr error
 	if d.mint != nil {
 		if err := d.mint.Teardown(ctx); err != nil {
@@ -139,7 +185,22 @@ func (d *composedDriver) Finalize(ctx context.Context) error {
 		}
 	}
 
-	return errors.Join(leakErr, teardownErr)
+	// Stop the trace collector last, after the repos (and their
+	// workflows) are gone, so it flushes everything it received.
+	var traceErr error
+	if d.traces != nil {
+		if err := d.traces.Stop(ctx); err != nil {
+			traceErr = fmt.Errorf("Finalize: trace collector: %w", err)
+		}
+	}
+
+	if d.pendingTraces != nil {
+		if err := d.pendingTraces.Stop(ctx); err != nil {
+			traceErr = errors.Join(traceErr, fmt.Errorf("Finalize: failed-start trace collector cleanup: %w", err))
+		}
+	}
+
+	return errors.Join(leakErr, teardownErr, traceErr)
 }
 
 // Capacity returns the max concurrent outstanding allocations.
@@ -160,6 +221,21 @@ func withRateLimitReporter(d Driver, client forge.Client) Driver {
 	}
 	return d
 }
+
+// withMintURL records mintURL as the URL a composed driver reports
+// through MintURLReporter; other drivers are returned unchanged.
+func withMintURL(d Driver, mintURL string) Driver {
+	if cd, ok := d.(*composedDriver); ok {
+		cd.mintURL = mintURL
+	}
+	return d
+}
+
+// MintURL implements MintURLReporter.
+func (d *composedDriver) MintURL() string { return d.mintURL }
+
+// Compile-time check: composedDriver reports its mint URL.
+var _ MintURLReporter = (*composedDriver)(nil)
 
 // logRateLimit writes one primary-quota sample, if a reporter is set
 // and has observed a response.

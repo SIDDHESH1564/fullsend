@@ -46,10 +46,12 @@ const (
 // stageMintConfig holds parameters for the STAGE durable mint deploy.
 type stageMintConfig struct {
 	pemDir            string
-	allowedOrgs       string
 	perRepoWIFRepos   string
 	workflowHostRepos string
 	appSet            string
+	// statusGitHubGroup enables GitHub user-token status auth for an
+	// ORG/TEAM; see cfmintConfig.statusGitHubGroup.
+	statusGitHubGroup string
 }
 
 // NewRepoPoolCFMintStage is a Factory that deploys a durable CF Worker
@@ -86,10 +88,10 @@ func NewRepoPoolCFMintStage(
 
 	cfg := stageMintConfig{
 		pemDir:            pemDir,
-		allowedOrgs:       "", // per-repo mode — no org-level allowlist
 		perRepoWIFRepos:   buildRepoList(StageOrg, poolSize),
-		workflowHostRepos: buildRepoList(StageOrg, poolSize),
+		workflowHostRepos: buildWorkflowHostRepoList(StageOrg, poolSize),
 		appSet:            envAppSet(),
+		statusGitHubGroup: mintStatusGitHubGroup(StageOrg),
 	}
 
 	md, err := newStageMintDriver(client, token, binary, gcpProjectID, logf, cfg)
@@ -119,24 +121,32 @@ func buildStageMintDriver(
 		return nil, fmt.Errorf("stage cfmint factory: deploying mint: %w", err)
 	}
 
-	// Non-vendored setup opts — use --fullsend-ref=main.
+	// Non-vendored setup opts — use --fullsend-ref=main. Runtime picks up
+	// PLAYBACK_RUNTIME when set, so this factory can also back a playback
+	// suite (see NewPlaybackDriver) in the stage environment.
 	setupOpts := common.GitHubSetupOpts{
+		AppSet:       envAppSet(),
 		Vendor:       false,
 		FullsendRef:  stageFullsendRef,
 		ConfigPreset: envConfigPreset(),
+		Runtime:      os.Getenv("PLAYBACK_RUNTIME"),
 	}
 
 	e2eCfg := e2etest.EnvConfig{
 		MintURL:      mintURL,
 		GCPProjectID: gcpProjectID,
 	}
-	ens := newRepoEnsurerWithOpts(e2eCfg, client, token, binary, setupOpts, logf)
+	ens, err := newRepoEnsurerWithOpts(e2eCfg, client, token, binary, setupOpts, logf,
+		playbackInstallHooks(setupOpts, logf))
+	if err != nil {
+		return nil, fmt.Errorf("stage cfmint factory: %w", err)
+	}
 
 	d, err := newComposedDriver(StageOrg, md, ens, poolSize, logf)
 	if err != nil {
 		return nil, err
 	}
-	return withRateLimitReporter(d, client), nil
+	return withTraceCollector(withRateLimitReporter(withMintURL(d, mintURL), client), client, logf), nil
 }
 
 // stageMintMintDriver deploys a durable CF Worker mint with a custom
@@ -200,7 +210,6 @@ func StageMintDeployArgs(cfg stageMintConfig) []string {
 		"--worker-name", StageMintWorkerName,
 		"--custom-domain", StageMintCustomDomain,
 		"--pem-dir", cfg.pemDir,
-		"--allowed-orgs", cfg.allowedOrgs,
 		"--per-repo-wif-repos", cfg.perRepoWIFRepos,
 		"--workflow-host-repos", cfg.workflowHostRepos,
 		// Hardcoded: stage BT mint allows all workflow basenames.
@@ -211,6 +220,7 @@ func StageMintDeployArgs(cfg stageMintConfig) []string {
 	if cfg.appSet != "" {
 		args = append(args, "--app-set", cfg.appSet)
 	}
+	args = appendStatusAuthArgs(args, cfg.statusGitHubGroup)
 	return args
 }
 

@@ -2,12 +2,15 @@ package security
 
 import (
 	"encoding/json"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/fullsend-ai/fullsend/internal/harness"
+	"github.com/fullsend-ai/fullsend/internal/sandbox"
 )
 
 // hookLibraryFile reports scripts shipped as imports for other hooks, not
@@ -68,6 +71,38 @@ func TestGenerateHooksConfig_AllDefaults(t *testing.T) {
 	assert.Len(t, chainedHooks, 1)
 	assert.Contains(t, chainedHooks[0].(map[string]any)["command"], "posttool_chain.py")
 	assert.NotContains(t, string(data), "canary_posttool.py")
+}
+
+func TestGenerateHooksConfigPinned_PinsInterpreterAndPath(t *testing.T) {
+	data, err := GenerateHooksConfigPinned(SandboxHookConfigFromHarness(&harness.Harness{Agent: "test.md"}),
+		"/opt/py thon/bin/python3", "/usr/local/bin:/usr/bin")
+	require.NoError(t, err)
+
+	var settings struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	require.NoError(t, json.Unmarshal(data, &settings))
+	n := 0
+	for _, groups := range settings.Hooks {
+		for _, g := range groups {
+			for _, h := range g.Hooks {
+				n++
+				assert.True(t, strings.HasPrefix(h.Command,
+					"PATH='/usr/local/bin:/usr/bin' '/opt/py thon/bin/python3' -E -s -B "+SandboxHooksDir+"/"), h.Command)
+			}
+		}
+	}
+	assert.NotZero(t, n)
+}
+
+func TestGenerateHooksConfig_DefaultIsolatesPythonEnvironment(t *testing.T) {
+	data, err := GenerateHooksConfig(SandboxHookConfigFromHarness(&harness.Harness{Agent: "test.md"}))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "'python3' -E -s -B "+SandboxHooksDir+"/tirith_check.py")
 }
 
 func TestGenerateHooksConfig_TirithDisabled(t *testing.T) {
@@ -620,4 +655,15 @@ func TestHookPlan_FailurePhaseFollowsSanitizersToo(t *testing.T) {
 	plan = HookPlan(SandboxHookConfigFromHarness(h))
 	assert.Equal(t, 0, countPhase(plan, HookPhasePostToolUseFailure))
 	assert.Equal(t, 0, countPhase(plan, HookPhasePostToolUse))
+}
+
+func TestSecretRedactHookPinsSandboxWorkspace(t *testing.T) {
+	// The hook hardcodes the checkout boundary as a Python literal that must
+	// match the runner's constant; a rename or move of SandboxWorkspace fails
+	// here instead of silently mis-scoping the checkout-scoped JWT skip.
+	pin := regexp.MustCompile(`(?m)^SANDBOX_WORKSPACE(?:\s*:\s*str)?\s*=\s*"` +
+		regexp.QuoteMeta(sandbox.SandboxWorkspace) + `"\s*$`)
+	if !pin.MatchString(string(SecretRedactPostToolHook)) {
+		t.Fatalf("secret_redact_posttool.py does not pin SANDBOX_WORKSPACE to %q", sandbox.SandboxWorkspace)
+	}
 }

@@ -5,14 +5,17 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
 )
 
 // newEventsPoller creates a Poller with test defaults suitable for events
 // and convert tests (sets projectPath, gitlabURL, and botUserID).
 func newEventsPoller(client GitLabClient) *Poller {
 	return New(client, nil, "group/project", Options{
-		BotUserID: 100,
-		GitLabURL: "https://gitlab.com",
+		BotUserID:      100,
+		GitLabURL:      "https://gitlab.com",
+		DispatchSecret: testDispatchSecret,
 	})
 }
 
@@ -98,6 +101,34 @@ func TestDiscoverAllEvents_LabelEvents(t *testing.T) {
 		t.Error("labelState missing IID 1")
 	} else if len(ls) != 1 || ls[0] != "ready-to-code" {
 		t.Errorf("labelState[1] = %v, want [ready-to-code]", ls)
+	}
+}
+
+func TestDiscoverAllEvents_LabelEventsLookupFailureHoldsLabel(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	since := now.Add(-time.Minute)
+	mc := newMockClient()
+	mc.issues = []Issue{
+		{IID: 1, UpdatedAt: now, Labels: []string{"ready-to-code"}},
+	}
+	mc.notes[1] = []Note{}
+	mc.labelEventsErr[1] = fmt.Errorf("label events unavailable")
+
+	p := newEventsPoller(mc)
+	events, labelState, minSkipped, err := p.discoverAllEvents(context.Background(), "group", "project", since)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, e := range events {
+		if e.Type == "issue_label" {
+			t.Errorf("issue_label event %q emitted without an occurrence ID; it must be held for retry", e.Key())
+		}
+	}
+	if ls := labelState[1]; len(ls) != 0 {
+		t.Errorf("labelState[1] = %v, want empty so the label is rediscovered", ls)
+	}
+	if !minSkipped.Equal(now) {
+		t.Errorf("minSkippedAt = %v, want %v so the watermark is held back", minSkipped, now)
 	}
 }
 
@@ -653,7 +684,7 @@ func TestDiscoverAllEvents_NoteFetchFailure(t *testing.T) {
 	mc := newMockClient()
 
 	// Set up existing label state so we can verify restoration.
-	mc.variables["FULLSEND_LABEL_STATE"] = `{"1":["ready-to-code"]}`
+	mc.setPollState(persistedPollState{LabelState: LabelState{1: {"ready-to-code"}}})
 
 	mc.issues = []Issue{
 		{IID: 1, UpdatedAt: now, Labels: []string{"ready-to-code", "ready-for-review"}},
@@ -943,7 +974,7 @@ func TestFilterBotEvents_RetainsBotChangesRequested(t *testing.T) {
 		{
 			Type:         "mr_note",
 			IID:          5,
-			NoteBody:     "Changes needed <!-- fullsend:changes-requested --> here",
+			NoteBody:     "Changes needed " + forge.ChangesRequestedMarker + " here",
 			IsBot:        true,
 			NoteAuthorID: 100, // matches botUserID
 		},
@@ -951,6 +982,46 @@ func TestFilterBotEvents_RetainsBotChangesRequested(t *testing.T) {
 	filtered := p.filterBotEvents(events)
 	if len(filtered) != 1 {
 		t.Fatalf("expected bot changes-requested marker to be retained, got %d events", len(filtered))
+	}
+}
+
+func TestFilterBotEvents_DropsBotNoteWithoutChangesRequestedMarker(t *testing.T) {
+	mc := newMockClient()
+	p := newEventsPoller(mc) // botUserID = 100
+
+	events := []RoutableEvent{
+		{
+			Type:         "mr_note",
+			IID:          5,
+			NoteBody:     "Please consider this suggestion <!-- fullsend:review-agent -->",
+			IsBot:        true,
+			NoteAuthorID: 100,
+		},
+	}
+	filtered := p.filterBotEvents(events)
+	if len(filtered) != 0 {
+		t.Fatalf("expected comment-only bot note without changes-requested marker to be dropped, got %d events", len(filtered))
+	}
+}
+
+func TestFilterBotEvents_DropsStaleRequestChangesMarker(t *testing.T) {
+	// GitLab previously posted <!-- fullsend:request-changes -->. That
+	// value must not be treated as the poller's trusted marker.
+	mc := newMockClient()
+	p := newEventsPoller(mc)
+
+	events := []RoutableEvent{
+		{
+			Type:         "mr_note",
+			IID:          5,
+			NoteBody:     "<!-- fullsend:request-changes -->\n\nPlease fix",
+			IsBot:        true,
+			NoteAuthorID: 100,
+		},
+	}
+	filtered := p.filterBotEvents(events)
+	if len(filtered) != 0 {
+		t.Fatalf("expected stale request-changes marker to be dropped, got %d events", len(filtered))
 	}
 }
 
@@ -1042,6 +1113,19 @@ func TestFilterBotEvents_RemovesBotMergedMR(t *testing.T) {
 	}
 }
 
+func TestFilterBotEvents_RetainsBotAppliedLabel(t *testing.T) {
+	mc := newMockClient()
+	p := newEventsPoller(mc) // botUserID = 100
+
+	events := []RoutableEvent{
+		{Type: "issue_label", IID: 5, ChangedLabel: "ready-to-code", IsBot: true, NoteAuthorID: 100},
+	}
+	filtered := p.filterBotEvents(events)
+	if len(filtered) != 1 {
+		t.Errorf("expected bot-applied label addition to be retained, got %d events", len(filtered))
+	}
+}
+
 func TestFilterBotEvents_RetainsNonBotEvents(t *testing.T) {
 	mc := newMockClient()
 	p := newEventsPoller(mc)
@@ -1096,9 +1180,10 @@ func TestDiscoverAllEvents_EventsModeSkipsSlashCommands(t *testing.T) {
 
 	// Use events mode — slash commands should be skipped.
 	p := New(mc, nil, "group/project", Options{
-		BotUserID: 100,
-		GitLabURL: "https://gitlab.com",
-		Mode:      "events",
+		BotUserID:      100,
+		GitLabURL:      "https://gitlab.com",
+		Mode:           "events",
+		DispatchSecret: testDispatchSecret,
 	})
 	events, _, _, err := p.discoverAllEvents(context.Background(), "group", "project", since)
 	if err != nil {
@@ -1143,9 +1228,10 @@ func TestDiscoverAllEvents_EventsModeSkipsWhitespacePrefixedSlash(t *testing.T) 
 	}
 
 	p := New(mc, nil, "group/project", Options{
-		BotUserID: 100,
-		GitLabURL: "https://gitlab.com",
-		Mode:      "events",
+		BotUserID:      100,
+		GitLabURL:      "https://gitlab.com",
+		Mode:           "events",
+		DispatchSecret: testDispatchSecret,
 	})
 	events, _, _, err := p.discoverAllEvents(context.Background(), "group", "project", since)
 	if err != nil {

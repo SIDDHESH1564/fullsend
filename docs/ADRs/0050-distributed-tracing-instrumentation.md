@@ -171,3 +171,23 @@ beside telemetry when at least one new score is produced (tool-agnostic). Distin
 spans only; the root span keeps `fullsend.cost_usd` and `fullsend.tool_calls`
 (custom-namespaced, not auto-summed by MLflow). This prevents MLflow from
 double-counting token usage across the trace.
+
+**2026-09-03 — Tool-call span topology ([ADR 0108](0108-tool-call-span-topology.md)):**
+each id-bearing tool call the runtime reports — Claude Code today; pi and
+codex emit no call ids — becomes an `execute_tool` child of its iteration's
+`agent` span, up to 1,024 per iteration, metadata only; the message record
+on the `agent` span stays the content carrier. Sub-agent nesting (deferred item 1 above)
+remains deferred.
+
+**2026-09-18 — Level 3 input message and tool arguments ([ADR 0108](0108-tool-call-span-topology.md)):**
+under the content gate, a retry iteration that carries validation feedback
+records the prompt the runner composed as `gen_ai.input.messages`, and
+`tool_call` parts on the message record carry the members of the call's
+arguments that name what was called (a path, a pattern, a `Bash` command
+whole, which can embed what it writes), not a `Write`, `Edit` or
+`NotebookEdit` body, an `Agent` or `WebFetch` prompt or the input of an
+MCP tool — Claude Code today
+([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)).
+The rest of the model's input is not recorded
+([reference](../guides/infrastructure/distributed-tracing.md#content-capture-level-3)).
+The gate and the carrier are unchanged.

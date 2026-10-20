@@ -34,15 +34,14 @@ const killStrayProcessesTimeout = 15 * time.Second
 // where such a survivor keeps files open, burns CPU/memory and writes into
 // the workspace the next iteration reads.
 //
-// Process-view assumptions, verified against OpenShell 0.0.116 and its
-// source: `sandbox exec` runs `sh -c <command>` as the sandbox user after
-// the supervisor drops privileges
-// (crates/openshell-supervisor-process/src/process.rs). With the podman
-// driver the supervisor is PID 1 owned by root
-// (crates/openshell-driver-podman/src/container.rs sets `user: "0:0"` and
-// the supervisor entrypoint), so it never appears in `ps -u <sandbox user>`;
-// on any driver it is an ancestor of this shell, which is what the
-// ancestry walk below spares — the root/PID 1 detail is not load-bearing.
+// Process-view assumptions, verified live on OpenShell 0.1.1 and 0.1.2 with
+// podman: `sandbox exec` runs `sh -c <command>` as the sandbox user, each
+// exec in its own process group, parented to the workload's PID 1
+// (`openshell-sandbox`; its arguments differ between releases, and nothing
+// here matches on them), which also runs as the sandbox user
+// and so appears in `ps -u`. PID 1 is an ancestor of this shell, which is
+// what the ancestry walk below spares; the supervisor runs in a separate
+// container and is not visible here.
 // The keep-alive main process (sandbox.KeepAliveCommand) does run as the
 // sandbox user with ppid 1, indistinguishable from a reparented stray by
 // tree shape, so it is excluded by argv: the command word is compared
@@ -66,10 +65,11 @@ const killStrayProcessesTimeout = 15 * time.Second
 //
 // Only tools the sandbox image ships are used (procps ps, mawk, dash
 // builtins, coreutils sleep/id) — no pkill/pgrep. A failed process listing
-// exits 3 (distinct from the always-0 sweep result) so the Go side warns
-// instead of trusting a silent zero; a failing `ps -p` liveness probe takes
-// the same exit, after KILLing everything that was TERMed, because its
-// empty answer is otherwise indistinguishable from "they are all gone".
+// (ps, or the awk that turns it into targets) exits 3 (distinct from the
+// always-0 sweep result) so the Go side warns instead of trusting a silent
+// zero; a failing `ps -p` liveness probe takes the same exit, after KILLing
+// everything that was TERMed, because its empty answer is otherwise
+// indistinguishable from "they are all gone".
 const killStrayProcessesTemplate = `# shellcheck shell=sh
 # Sweep processes left behind by the previous iteration. pi's bash tool
 # spawns commands detached and kills that tree only on abort/timeout
@@ -85,10 +85,10 @@ const killStrayProcessesTemplate = `# shellcheck shell=sh
 # matched on argv with any directory stripped from the command word
 # (/usr/bin/sleep infinity counts), so an agent-started literal
 # "sleep infinity" is spared as well. TERM first, then KILL whatever is
-# still alive after 2s. The count goes to stdout; a process listing or a
-# liveness probe that fails exits 3 so the runner warns instead of
-# trusting a zero. The user is selected by numeric uid: the sandbox user
-# need not be resolvable through NSS.
+# still alive after 2s. The count goes to stdout; a process listing, the
+# awk that turns it into targets, or a liveness probe that fails exits 3
+# so the runner warns instead of trusting a zero. The user is selected by
+# numeric uid: the sandbox user need not be resolvable through NSS.
 me=$$
 listing=$(ps -o pid= -o ppid= -o stat= -o args= -u "$(id -u)" 2>/dev/null) || {
   echo 'stray processes: ps failed' >&2
@@ -131,7 +131,10 @@ targets=$(printf '%s\n' "$listing" | awk -v me="$me" -v keep=__KEEPALIVE__ '
       if (cmd[p] == keep) continue
       print p
     }
-  }')
+  }') || {
+  echo 'stray processes: awk failed' >&2
+  exit 3
+}
 count=0
 pids=""
 signalled=""
@@ -205,8 +208,9 @@ var strayProcessesKilledRe = regexp.MustCompile(`(?m)^stray processes killed: ([
 // killStrayProcesses runs the sweep snippet in the sandbox through execFn
 // (sandbox.Exec in production) and returns the number of processes it
 // signalled. Any failure — a gateway error, a timeout, a non-zero exit
-// (exit 3 is the snippet's own "ps failed"), or output the snippet never
-// produces — is returned as an error for the caller to downgrade.
+// (exit 3 is the snippet's own "ps failed" / "awk failed"), or output the
+// snippet never produces — is returned as an error for the caller to
+// downgrade.
 func killStrayProcesses(execFn sandboxExecFunc, sandboxName string) (int, error) {
 	stdout, stderr, exitCode, err := execFn(sandboxName, killStrayProcessesScript(), killStrayProcessesTimeout)
 	if err != nil {

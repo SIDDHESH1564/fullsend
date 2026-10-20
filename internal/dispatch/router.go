@@ -1,10 +1,20 @@
 package dispatch
 
-import "strings"
+import (
+	"slices"
+	"strings"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
+)
 
 // changesRequestedMarker is the HTML comment that the review bot
-// embeds in MR notes to signal the fix stage.
-const changesRequestedMarker = "<!-- fullsend:changes-requested -->"
+// embeds in MR notes to signal the fix stage. Aliased from forge so
+// GitLab note posting, poller retention, and routing stay in lockstep.
+const changesRequestedMarker = forge.ChangesRequestedMarker
+
+// noFixLabel suppresses bot-triggered fix dispatch, matching GitHub's
+// check-fix-eligibility.sh. Applied by /fs-fix-stop; see docs/agents/fix.md.
+const noFixLabel = "fullsend-no-fix"
 
 // HarnessRouter implements EventRouter by applying the default routing
 // rules from ADR 0067's event routing table. Slash commands (/fs-X)
@@ -70,6 +80,15 @@ func (r *HarnessRouter) routeComment(event *NormalizedEvent) ([]string, error) {
 			return nil, nil
 		}
 		if !r.validAgents["fix"] {
+			return nil, nil
+		}
+		// fullsend-no-fix suppresses bot-triggered fix runs, matching
+		// GitHub's check-fix-eligibility.sh gate. GitHub also requires
+		// a fullsend-fix opt-in label for non-coder-bot/human-authored
+		// PRs; State does not yet carry enough MR-author identity to
+		// replicate that half of the gate for GitLab, so it is deferred
+		// (see docs/agents/fix.md Control labels section).
+		if slices.Contains(event.State.Labels, noFixLabel) {
 			return nil, nil
 		}
 		return []string{"fix"}, nil
@@ -153,27 +172,37 @@ func (r *HarnessRouter) routeLabel(event *NormalizedEvent) ([]string, error) {
 
 // routeMerge does not verify the merge/close actor's role — retro is a
 // read-only analysis stage, so dispatching it carries no mutation risk.
-// Both merged and closed-unmerged transitions dispatch retro.
+// Both merged and closed-unmerged transitions dispatch retro. Only
+// change proposals reach retro: a closed work item (issue close, which
+// the GitLab webhook builder can emit) is not a retro trigger.
 func (r *HarnessRouter) routeMerge(event *NormalizedEvent) ([]string, error) {
+	if event.Entity.Kind != "change_proposal" {
+		return nil, nil
+	}
 	if !r.validAgents["retro"] {
 		return nil, nil
 	}
 	return []string{"retro"}, nil
 }
 
-// routeOpened dispatches review when a change proposal is opened.
+// routeOpened dispatches triage for a new GitLab work item and review for a
+// new change proposal. Jira issue opening retains its existing routing.
 // Authorization is enforced in the GitLab agent template (Developer+),
 // matching the previous native merge_request_event path. Review is
 // read-only, so fork MRs are allowed; the agent template skips write
 // stages on forks.
 func (r *HarnessRouter) routeOpened(event *NormalizedEvent) ([]string, error) {
-	if event.Entity.Kind != "change_proposal" {
-		return nil, nil
+	switch event.Entity.Kind {
+	case "work_item":
+		if event.Source.System == "gitlab" && r.validAgents["triage"] {
+			return []string{"triage"}, nil
+		}
+	case "change_proposal":
+		if r.validAgents["review"] {
+			return []string{"review"}, nil
+		}
 	}
-	if !r.validAgents["review"] {
-		return nil, nil
-	}
-	return []string{"review"}, nil
+	return nil, nil
 }
 
 // isForkOrUnknown reports whether the event's change proposal state

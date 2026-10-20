@@ -55,6 +55,19 @@ const piVertexExtensionPath = sandbox.SandboxPiExtensionsDir + "/anthropic-verte
 // built-in xai provider cannot shadow this one (#6571).
 const piXaiVertexExtensionPath = sandbox.SandboxPiExtensionsDir + "/xai-vertex"
 
+// piInferenceGatewayExtensionPath is the inference-gateway provider for pi
+// (fullsend-ai/pi-inference-gateway, pinned in the sandbox image by
+// PI_INFERENCE_GATEWAY_VERSION). It fronts OpenAI- or Anthropic-compatible
+// gateways (LiteLLM, agentgateway, APISIX and similar) and registers one
+// provider (default id "gateway") whose models come from the gateway's
+// /v1/models. Run loads it with `-e` only when an inference.gateway block
+// applies (SetPiGatewayRun) and a resolved model is on the gateway
+// provider; it then also guards the rendered inference-gateway.json and
+// owns the INFERENCE_GATEWAY_* environment (pi_gateway_run.go, #8280).
+// Without a block the runner leaves it alone, so a harness may still load
+// it as a plugin.
+const piInferenceGatewayExtensionPath = sandbox.SandboxPiExtensionsDir + "/inference-gateway"
+
 // OpenAI on pi: unlike the Vertex providers, OpenAI uses a runner-exchanged
 // short-lived access token (WIF or a static OPENAI_API_KEY) delivered as a
 // credential placeholder through the run-scoped OpenShell provider, not
@@ -64,11 +77,22 @@ const piXaiVertexExtensionPath = sandbox.SandboxPiExtensionsDir + "/xai-vertex"
 
 func (PiRuntime) Name() string { return "pi" }
 
-// System returns the OTEL GenAI gen_ai.system value. Pi is multi-provider
-// (anthropic, google-vertex, community extensions), so the system is the
-// runtime itself rather than a single model vendor (same precedent as
-// OpenCodeRuntime).
+// System is the no-resolver fallback required by Runtime. Pi always has a
+// serving endpoint (ProviderFor uses translatePiModel, which defaults a
+// bare/empty model to anthropic-vertex/opus), so agent spans must go
+// through ProviderFor / GenAISystemFor and never this value (#7245).
 func (PiRuntime) System() string { return "pi" }
+
+// ProviderFor returns the serving-endpoint provider of the model pi will
+// call: the lowercase prefix of translatePiModel, the same value the run
+// command and NeedsOpenAIProvider already branch on. A Claude id on Vertex
+// is "anthropic-vertex", a Grok id is "xai-vertex", Gemini is
+// "google-vertex", GPT is "openai". The publisher ("anthropic", "xai") is
+// not used: two runs of the same publisher model through different
+// endpoints are different inference paths.
+func (PiRuntime) ProviderFor(model, agentModel string, aliases map[string]string) string {
+	return piModelProvider(EffectiveModel(model, agentModel), aliases)
+}
 
 // ConfigDir returns the pi config directory inside the sandbox. It is
 // exported to the agent process as PI_CODING_AGENT_DIR (see EnvExports) and
@@ -134,6 +158,7 @@ var (
 	_ Runtime           = PiRuntime{}
 	_ TranscriptHandler = PiRuntime{}
 	_ DebugLogNamer     = PiRuntime{}
+	_ ProviderResolver  = PiRuntime{}
 
 	_ OpenAICredentialSeeder = PiRuntime{}
 )
