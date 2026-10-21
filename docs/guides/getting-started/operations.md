@@ -236,7 +236,7 @@ gcloud services enable \
 
 See [Status Notifications](../user/customizing-agents.md#status-notifications) for configuring start/completion comments and reactions.
 
-The composite action accepts five optional inputs for status notifications:
+The composite action accepts seven optional inputs for status notifications and review reconciliation:
 
 | Input | Description |
 |-------|-------------|
@@ -245,8 +245,10 @@ The composite action accepts five optional inputs for status notifications:
 | `status-number` | Issue or PR number for status comments |
 | `status-comment-id` | ID of the comment that triggered a slash-command run; when set, reactions target that comment instead of the issue/PR |
 | `mint-url` | URL of the token mint service used to obtain fresh tokens for posting comments |
+| `role` | Mint role selected by dispatch, used to reconcile an interrupted run before the agent reports its resolved role (default: empty) |
+| `pr-head-sha` | PR head commit SHA for per-repo workflows whose event payload does not include it; takes precedence over native PR and workflow dispatch event extraction (default: empty) |
 
-All reusable workflows pass these inputs automatically.
+Reusable workflows pass the inputs they need automatically.
 
 ### GitLab CI
 
@@ -299,7 +301,7 @@ Local `fullsend poll` / `fullsend run --forge gitlab` against a private-CA insta
 
 ### Sandbox hosts
 
-OpenShell sandboxes do **not** inherit `CI_SERVER_TLS_CA_FILE`. That path is job-local and must not be treated as available inside the sandbox or on a remote gateway host. Agent-controlled TLS environment overrides (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`) stay blocked.
+OpenShell sandboxes do **not** inherit `CI_SERVER_TLS_CA_FILE`. That path is job-local and must not be treated as available inside the sandbox or on a remote gateway host. Agent-controlled TLS environment overrides (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`) stay blocked; see [Migrating proxy and certificate settings](../user/customizing-agents.md#migrating-proxy-and-certificate-settings) for where those settings go instead.
 
 The OpenShell supervisor reads a fixed list of system CA paths in the sandbox container to build upstream trust (GitLab, registries, inference) and the bundle handed to sandboxed processes. Administrators provision that trust on the **sandbox host**, independently of the job container:
 
